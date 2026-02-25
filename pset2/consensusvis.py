@@ -18,12 +18,12 @@ def parse_lines(lines):
     """Parse message trace lines into events."""
     # Pattern: timestamp: src → dst "msg"  or  timestamp: dst ← src "msg"
     pat = re.compile(
-        r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+):\s+'
+        r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6})\d*:\s+'
         r'(-?\d+)\s+(→|←)\s+(-?\d+)\s+"([^"]*)"'
     )
     # Pattern for receiver-only format: timestamp: dst ← "msg" (no sender)
     pat_recv_nosrc = re.compile(
-        r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+):\s+'
+        r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6})\d*:\s+'
         r'(-?\d+)\s+←\s+"([^"]*)"'
     )
     events = []
