@@ -1,4 +1,5 @@
 #pragma once
+#include <format>
 #include <variant>
 #include <deque>
 #include "pancy_msgs.hh"
@@ -26,3 +27,44 @@ struct ack_msg : base_message {
 
 
 using paxos_message = std::variant<prepare_msg, ack_msg>;
+
+
+// thanks claude for this!
+namespace std {
+
+template <typename CharT>
+struct formatter<prepare_msg, CharT> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(const prepare_msg& m, FormatContext& ctx) const {
+        return std::format_to(ctx.out(),
+            "PREPARE(round={}, leader={}, committed={}, prev=[{},{}], batch_start={}, entries={})",
+            m.round, m.leader_id, m.committed_slot,
+            m.prev_slot, m.prev_round,
+            m.batch_start, m.entries.size());
+    }
+};
+
+template <typename CharT>
+struct formatter<ack_msg, CharT> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(const ack_msg& m, FormatContext& ctx) const {
+        return std::format_to(ctx.out(),
+            "ACK(round={}, success={}, highest_accepted={})",
+            m.round, m.success, m.highest_accepted);
+    }
+};
+
+template <typename CharT>
+struct formatter<paxos_message, CharT> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(const paxos_message& m, FormatContext& ctx) const {
+        return std::visit([&](auto&& msg) -> FormatContext::iterator {
+            return std::format_to(ctx.out(), "{}", msg);
+        }, m);
+    }
+};
+
+}
