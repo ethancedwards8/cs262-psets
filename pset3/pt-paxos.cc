@@ -60,6 +60,8 @@ struct pt_paxos_replica {
     void initialize(pt_paxos_instance&);
 
     cot::task<> run();
+    cot::task<> run_as_leader();
+    cot::task<> run_as_follower();
 };
 
 struct pt_paxos_instance {
@@ -116,22 +118,28 @@ pt_paxos_instance::pt_paxos_instance(testinfo& tester, client_model& clients)
 // ********** PANCY SERVICE CODE **********
 
 cot::task<> pt_paxos_replica::run() {
-    // Your code here! The handout code just implements a single primary.
+    if (index_ == leader_index_) {
+        co_await run_as_leader();
+    } else {
+        co_await run_as_follower();
+    }
+}
 
+cot::task<> pt_paxos_replica::run_as_leader() {
+    // Placeholder leader logic: process client requests locally.
     while (true) {
-        // receive message
         auto req = co_await from_clients_.receive();
-
-        // if not leader, redirect
-        if (index_ != leader_index_) {
-            co_await to_clients_.send(pancy::redirection_response{
-                pancy::response_header(req, pancy::errc::redirect), leader_index_
-            });
-            continue;
-        }
-
-        // if leader, process message and send response
         co_await to_clients_.send(db_.process_req(req));
+    }
+}
+
+cot::task<> pt_paxos_replica::run_as_follower() {
+    // Placeholder follower logic: redirect clients to the current leader.
+    while (true) {
+        auto req = co_await from_clients_.receive();
+        co_await to_clients_.send(pancy::redirection_response{
+            pancy::response_header(req, pancy::errc::redirect), leader_index_
+        });
     }
 }
 
