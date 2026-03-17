@@ -1,6 +1,7 @@
 #include "lockseq_model.hh"
 #include "pancydb.hh"
 #include "netsim.hh"
+#include "paxos.hh"
 
 namespace cot = cotamer;
 using namespace std::chrono_literals;
@@ -41,7 +42,7 @@ struct testinfo {
 struct pt_paxos_instance;
 
 // The type for inter-replica messages. You will change this!
-using paxos_message = /* YOUR TYPE HERE */ int;
+// paxos_message is defined in paxos.hh
 
 struct pt_paxos_replica {
     size_t index_;           // index of this replica in the replica set
