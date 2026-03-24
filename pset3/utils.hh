@@ -1,6 +1,7 @@
 #pragma once
 #include <charconv>
 #include <chrono>
+#include <concepts>
 #include <random>
 #include <string>
 #include <system_error>
@@ -14,6 +15,11 @@ inline std::errc from_str_chars(const std::string& s, T& value, Args... rest) {
         ec = std::errc::invalid_argument;
     }
     return ec;
+}
+
+template <std::integral T>
+inline std::errc from_str_chars(const std::string& s, T& value) {
+    return from_str_chars(s, value, 10);
 }
 
 // - perform std::from_chars on `s`; all of `s` must be parsed. return parsed
