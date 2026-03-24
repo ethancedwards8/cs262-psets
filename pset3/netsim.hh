@@ -187,14 +187,20 @@ cot::task<> channel<T>::send_after(cot::duration delay, message_type m) {
 
 template <typename T>
 auto port<T>::receive_with_id() -> cot::task<std::pair<T, std::string>> {
-    // sleep until there’s a message
-    while (messageq_.empty()) {
-        cot::driver_guard guard;
-        // Register an event that senders will trigger on delivery.
-        // Need a new one every time because events are one-shot.
-        co_await receivable_.arm();
-        co_await cot::after(receive_delay_);
-    }
+    do {
+        // Suspend until there’s a message
+        while (messageq_.empty()) {
+            cot::driver_guard guard;
+            // Register an event that senders will trigger on delivery.
+            // Need a new one every time because events are one-shot.
+            co_await receivable_.arm();
+            // Suspend for receive delay
+            co_await cot::after(receive_delay_);
+        }
+
+        // Suspend to ensure our return value will be used
+        co_await cot::resolve{};
+    } while (messageq_.empty());
 
     auto m = std::move(messageq_.front());
     messageq_.pop_front();
