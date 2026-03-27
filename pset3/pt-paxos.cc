@@ -171,27 +171,34 @@ cot::task<> pt_paxos_replica::run_as_follower() {
             from_replicas_.receive()
         );
 
-        if (msg.index() == 0) {
-            auto req = std::get<0>(msg);
+        auto* req = std::get_if<pancy::request>(&msg);
+        if (req) {
             co_await to_clients_.send(pancy::redirection_response{
-                pancy::response_header(req, pancy::errc::redirect), leader_index_
+                pancy::response_header(*req, pancy::errc::redirect), leader_index_
             });
             continue;
         }
 
-        auto paxos_msg = std::get<1>(msg);
-        if (auto* prepare = std::get_if<prepare_msg>(&paxos_msg)) {
-            leader_index_ = prepare->leader_id;
-            for (const auto& entry : prepare->entries) {
-                db_.process_req(entry);
-            }
-
-            ack_msg ack;
-            ack.round = prepare->round;
-            ack.success = true;
-            ack.highest_accepted = prepare->batch_start + prepare->entries.size();
-            co_await to_replicas_[leader_index_]->send(ack);
+        auto* paxos_msg = std::get_if<paxos_message>(&msg);
+        if (!paxos_msg) {
+            continue;
         }
+
+        auto* prepare = std::get_if<prepare_msg>(paxos_msg);
+        if (!prepare) {
+            continue;
+        }
+
+        leader_index_ = prepare->leader_id;
+        for (const auto& entry : prepare->entries) {
+            db_.process_req(entry);
+        }
+
+        ack_msg ack;
+        ack.round = prepare->round;
+        ack.success = true;
+        ack.highest_accepted = prepare->batch_start + prepare->entries.size();
+        co_await to_replicas_[leader_index_]->send(ack);
     }
 }
 
