@@ -79,3 +79,18 @@ impractical? I'm not sure. Anyways, LLMs seem to think that using std::variant i
 ```c++
 using paxos_message = std::variant<prepare_paxos_msg, ack_paxos_msg>;
 ```
+
+
+From there, separating out the logic for leaders/replicas makes things easier to read and reason about:
+
+Leader:
+
+Leader recv. client request, fans out req to followers.
+
+Waits for a quorum of followers to send acks back, applies req to db if quorom
+reached, and then replies to client.
+
+
+Follower:
+
+Takes req from leader, processes it and sends ack.

@@ -54,7 +54,10 @@ struct pt_paxos_replica {
     // channels for inter-replica messages:
     std::vector<std::unique_ptr<netsim::channel<paxos_message>>> to_replicas_;
     pancy::pancydb db_;      // our copy of the database
+
+
     // ...plus anything you want to add
+    unsigned long long next_round_ = 1;
 
     pt_paxos_replica(size_t index, size_t nreplicas, random_source&);
     void initialize(pt_paxos_instance&);
@@ -62,6 +65,9 @@ struct pt_paxos_replica {
     cot::task<> run();
     cot::task<> run_as_leader();
     cot::task<> run_as_follower();
+
+private: 
+    unsigned long quorum_ = nreplicas_ / 2 + 1;
 };
 
 struct pt_paxos_instance {
@@ -126,20 +132,66 @@ cot::task<> pt_paxos_replica::run() {
 }
 
 cot::task<> pt_paxos_replica::run_as_leader() {
-    // Placeholder leader logic: process client requests locally.
     while (true) {
         auto req = co_await from_clients_.receive();
+
+        prepare_msg prepare;
+        prepare.round = next_round_++;
+        prepare.leader_id = index_;
+        prepare.entries.push_back(req);
+        for (size_t s = 0; s != nreplicas_; ++s) {
+            if (s == index_)
+                continue;
+
+            co_await to_replicas_[s]->send(prepare);
+        }
+
+        size_t ack_count = 0;
+        while (ack_count < quorum_ - 1) {
+            auto paxos_msg = co_await from_replicas_.receive();
+            auto* ack = std::get_if<ack_msg>(&paxos_msg);
+
+            if (!ack)
+                continue;
+
+            if (ack->round != prepare.round || !ack->success)
+                continue;
+
+            ++ack_count;
+        }
+
         co_await to_clients_.send(db_.process_req(req));
     }
 }
 
 cot::task<> pt_paxos_replica::run_as_follower() {
-    // Placeholder follower logic: redirect clients to the current leader.
     while (true) {
-        auto req = co_await from_clients_.receive();
-        co_await to_clients_.send(pancy::redirection_response{
-            pancy::response_header(req, pancy::errc::redirect), leader_index_
-        });
+        auto msg = co_await cot::first(
+            from_clients_.receive(),
+            from_replicas_.receive()
+        );
+
+        if (msg.index() == 0) {
+            auto req = std::get<0>(msg);
+            co_await to_clients_.send(pancy::redirection_response{
+                pancy::response_header(req, pancy::errc::redirect), leader_index_
+            });
+            continue;
+        }
+
+        auto paxos_msg = std::get<1>(msg);
+        if (auto* prepare = std::get_if<prepare_msg>(&paxos_msg)) {
+            leader_index_ = prepare->leader_id;
+            for (const auto& entry : prepare->entries) {
+                db_.process_req(entry);
+            }
+
+            ack_msg ack;
+            ack.round = prepare->round;
+            ack.success = true;
+            ack.highest_accepted = prepare->batch_start + prepare->entries.size();
+            co_await to_replicas_[leader_index_]->send(ack);
+        }
     }
 }
 
