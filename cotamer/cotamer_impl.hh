@@ -138,15 +138,25 @@ struct fd_body {
 //    defined by the C++ language standard; the runtime calls its methods in
 //    specific situations, such as when a `co_await` expression is evaluated.
 
+// Generic coroutine functionality involving suspension, resumption, resolution,
+// and interest is in the common `task_promise_base`, and we use functions like
+// std::coroutine_handle::from_address() to obtain a task_promise_base without
+// needing the precise type of the task. This is strictly speaking UB -- one can
+// only call coroutine_handle<T>::from_address() if T is the actual promise type
+// or void -- but it works on GCC and Clang when the actual promise type and the
+// base type have the same alignment. We check the alignment with static_assert.
+
 struct task_promise_base {
     bool detached_ = false;                // is this task detached?
     bool has_interest_ = false;            // has interest been requested?
     bool resolving_ = false;               // is task awaiting resolve{}?
+    bool forwarded_ = false;               // is task subject to cot::forward()?
+    bool in_resolve_ = false;              // is resolve() currently driving me?
     driver* home_;                         // coroutine home driver
     event_handle resolution_;              // resolution event (lazily created)
     event_handle interest_;                // interest event (lazily created)
-    // coroutine awaiting me, if any
-    std::coroutine_handle<task_promise_base> continuation_;
+    task_promise_base* awaiter_ = nullptr; // coroutine awaiting me, if any
+    task_promise_base* forward_ = nullptr; // awaited forward coroutine, if any
 
     inline task_promise_base()
         : home_(driver::current.get()) {
@@ -156,9 +166,24 @@ struct task_promise_base {
         COTAMER_STAT_INCR(promises_destroyed);
     }
 
+    inline std::coroutine_handle<> base_handle() {
+        return std::coroutine_handle<task_promise_base>::from_promise(*this);
+    }
+    inline constexpr task_promise_base* active_awaiter() const noexcept {
+        auto* a = awaiter_;
+        while (a && a->forward_) {
+            a = a->awaiter_;
+        }
+        return a;
+    }
+
     inline event_handle& make_interest();
+    inline event resolution();
     bool resolve();
+    inline void set_awaiter(task_promise_base&);
+    inline void resolution_point();
 };
+
 
 template <typename T>
 struct task_promise : public task_promise_base {
@@ -190,12 +215,6 @@ struct task_promise : public task_promise_base {
 
 template <typename T>
 inline task<T> task_promise<T>::get_return_object() noexcept {
-    // When an event schedules a task_promise, it needs the task's home driver.
-    // It uses coroutine_handle<task_promise_base>::from_address() to get it.
-    // That is strictly speaking UB -- one can only call
-    // coroutine_handle<T>::from_address() if T is the actual promise type or
-    // void -- but it works on GCC and Clang when the actual promise type
-    // and the base type have the same alignment.
     static_assert(alignof(task_promise<T>) == alignof(task_promise_base));
     return task<T>{std::coroutine_handle<task_promise<T>>::from_promise(*this)};
 }
@@ -238,7 +257,6 @@ struct task_promise<void> : public task_promise_base {
 };
 
 inline task<void> task_promise<void>::get_return_object() noexcept {
-    // See comment in task_promise<T>::get_return_object.
     static_assert(alignof(task_promise<void>) == alignof(task_promise_base));
     return task<void>{std::coroutine_handle<task_promise<void>>::from_promise(*this)};
 }
@@ -258,29 +276,21 @@ template <typename T>
 struct task_awaiter {
     // - Return true if `co_await` should not suspend
     bool await_ready() noexcept {
-        return self_.done() || self_.promise().resolve();
+        return awaitee_.done() || awaitee_.promise().resolve();
     }
     // - Suspend this coroutine and return the next coroutine to execute
     template <typename U>
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<U>> awaiting) {
-        if (awaiting.promise().home_ != self_.promise().home_) {
-            throw cotamer_error(cotamer_errc::cross_driver_await);
-        }
-        // XXX UB, but see task_promise<T>::get_return_object
-        std::coroutine_handle<task_promise_base> base_awaiting =
-            std::coroutine_handle<task_promise_base>::from_address(awaiting.address());
-        self_.promise().continuation_ = base_awaiting;
-        if (self_.promise().interest_) {
-            self_.promise().interest_->trigger();
-        }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<U>> awaiter) {
+        static_assert(alignof(task_promise<U>) == alignof(task_promise_base));
+        awaitee_.promise().set_awaiter(awaiter.promise());
         return std::noop_coroutine();
     }
     // - Resume this coroutine, returning the `co_await` expression’s result
     T await_resume() {
-        return self_.promise().result();
+        return awaitee_.promise().result();
     }
 
-    std::coroutine_handle<task_promise<T>> self_;
+    std::coroutine_handle<task_promise<T>> awaitee_;
 };
 
 
@@ -290,24 +300,7 @@ struct task_final_awaiter {
         return false;
     }
     template <typename T>
-    inline std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<T>> self) noexcept {
-        auto& promise = self.promise();
-        // trigger resolution event, since the task is done
-        if (promise.resolution_) {
-            promise.resolution_->trigger();
-        }
-        // if another coroutine wants this task's result, resume it directly
-        // (cross-driver awaits are rejected at co_await time, so the
-        // continuation is always on the same driver)
-        if (promise.continuation_) {
-            return std::exchange(promise.continuation_, nullptr);
-        }
-        // destroy if detached and then return to event loop
-        if (promise.detached_) {
-            self.destroy();
-        }
-        return std::noop_coroutine();
-    }
+    inline std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<T>> self) noexcept;
     void await_resume() noexcept {
     }
 };
@@ -329,16 +322,13 @@ struct task_resolution_awaiter {
     }
     template <typename T>
     inline std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<T>> self) noexcept {
-        auto& promise = self.promise();
-        if (promise.continuation_) {
-            // someone wants our value already, so keep running
+        auto& p = self.promise();
+        if (p.active_awaiter()) {
+            // someone actively wants our value, so keep running
             return self;
         }
-        if (promise.resolution_) {
-            promise.resolution_->trigger();
-        }
-        promise.resolving_ = true;
-        if (promise.detached_) {
+        p.resolution_point();
+        if (p.detached_) {
             self.destroy();
         }
         return std::noop_coroutine();
@@ -986,6 +976,60 @@ inline task_mutex_event_awaiter<void, shared> task_promise<void>::await_transfor
     return task_mutex_event_awaiter<void, shared>{{std::move(ev).handle(), nullptr}, ev.mutex()};
 }
 
+
+// task_promise_base methods
+
+inline event task_promise_base::resolution() {
+    if (!resolution_ && !resolving_) {
+        resolution_ = event_handle(new event_body);
+    }
+    return event(resolution_);
+}
+
+inline void task_promise_base::set_awaiter(task_promise_base& awaiter) {
+    if (home_ != awaiter.home_) {
+        throw cotamer_error(cotamer_errc::cross_driver_await);
+    } else if (detached_) {
+        throw cotamer_error(cotamer_errc::detached_await);
+    }
+    awaiter_ = &awaiter;
+    awaiter.forward_ = nullptr;
+    if (interest_) {
+        interest_->trigger();
+    }
+    if (forwarded_) {
+        forwarded_ = false;
+        awaiter.forward_ = this;
+        awaiter.resolving_ = resolving_;
+    }
+}
+
+inline void task_promise_base::resolution_point() {
+    resolving_ = true;
+    if (resolution_) {
+        resolution_->trigger();
+    }
+    if (awaiter_ && awaiter_->forward_) {
+        awaiter_->resolution_point();
+    }
+}
+
+template <typename T>
+inline std::coroutine_handle<> task_final_awaiter::await_suspend(std::coroutine_handle<task_promise<T>> self) noexcept {
+    auto& p = self.promise();
+    // trigger resolution event, since the task is done
+    p.resolution_point();
+    // resume awaiter directly, unless resolve() is driving the chain
+    if (p.awaiter_ && !p.in_resolve_) {
+        return p.awaiter_->base_handle();
+    }
+    // destroy if detached and then return to event loop
+    if (p.detached_) {
+        self.destroy();
+    }
+    return std::noop_coroutine();
+}
+
 }
 
 
@@ -1089,7 +1133,7 @@ inline bool task<T>::done() const {
 
 template <typename T>
 inline bool task<T>::resolvable() const {
-    return handle_ && (handle_.done() || handle_.promise().resolving_);
+    return handle_ && handle_.promise().resolving_;
 }
 
 template <typename T>
@@ -1102,17 +1146,7 @@ inline bool task<T>::resolve() {
 
 template <typename T>
 inline event task<T>::resolution() {
-    if (!handle_) {
-        return event();
-    }
-    auto& p = handle_.promise();
-    if (handle_.done() || p.resolving_) {
-        return event(nullptr);
-    }
-    if (!p.resolution_) {
-        p.resolution_ = detail::event_handle(new detail::event_body);
-    }
-    return event(p.resolution_);
+    return handle_ ? handle_.promise().resolution() : event();
 }
 
 template <typename T>
@@ -1140,7 +1174,7 @@ inline void task<T>::detach() {
     }
     auto& p = handle_.promise();
     p.detached_ = true;
-    if (handle_.done() || p.resolving_) {
+    if (p.resolving_) {
         handle_.destroy();
     }
     handle_ = nullptr;
@@ -1369,11 +1403,11 @@ inline event closed(const fd& f) {
 // any(), all()
 //    Multi-argument forms create a quorum_event_body. Single-argument forms
 //    pass through to make_event (no quorum needed). Zero-argument forms
-//    return an already-triggered event.
+//    return an appropriate event.
 
-template <typename E0, typename... Es>
-inline event any(E0 e0, Es&&... es) {
-    auto q = new detail::quorum_event_body(1, std::forward<E0>(e0), std::forward<Es>(es)...);
+template <typename... Es>
+inline event any(Es&&... es) {
+    auto q = new detail::quorum_event_body(1, std::forward<Es>(es)...);
     return detail::event_handle(q);
 }
 
@@ -1383,10 +1417,8 @@ inline event any(E&& e) {
 }
 
 inline event any() {
-    // any() with no arguments returns an already-triggered event.
-    // An alternate design would treat any() as an untriggered event (like
-    // how false is the identity for logical or).
-    return event(nullptr);
+    // An untriggered event (false is the identity for logical or)
+    return event();
 }
 
 
@@ -1402,6 +1434,7 @@ inline event all(E&& e) {
 }
 
 inline event all() {
+    // A triggered event (true is the identity for logical and)
     return event(nullptr);
 }
 
@@ -1595,6 +1628,7 @@ template <typename... Ts>
 task<std::variant<task_return_type_t<Ts>...>> first(Ts... ts) {
     using Variant = std::variant<task_return_type_t<Ts>...>;
     while (true) {
+        co_await resolve{};
         size_t ridx = detail::find_resolved(0, std::forward<Ts>(ts)...);
         if (ridx != sizeof...(ts)) {
             co_return co_await detail::complete_first<Variant, 0>(ridx, std::forward<Ts&>(ts)...);
@@ -1604,13 +1638,21 @@ task<std::variant<task_return_type_t<Ts>...>> first(Ts... ts) {
     }
 }
 
-inline task<> race() {
-    return task<>();
+template <typename T>
+inline task<T> race() {
+    co_await event(); // never resumes
+    throw cotamer_error(cotamer_errc::unreachable);
+}
+
+template <typename T>
+inline task<T> race(task<T> t) {
+    return t;
 }
 
 template <typename T, typename... Trest>
 task<T> race(task<T> t0, Trest... ts) {
     while (true) {
+        co_await resolve{};
         size_t ridx = detail::find_resolved(0, std::forward<task<T>>(t0), std::forward<Trest>(ts)...);
         if (ridx != 1 + sizeof...(ts)) {
             co_return co_await detail::complete_race<0>(ridx, t0, std::forward<Trest&>(ts)...);
@@ -1624,6 +1666,7 @@ task<T> race(task<T> t0, Trest... ts) {
 template <typename... Trest>
 task<> race(event e0, Trest... ts) {
     while (true) {
+        co_await resolve{};
         size_t ridx = detail::find_resolved(0, std::forward<event>(e0), std::forward<Trest>(ts)...);
         if (ridx != 1 + sizeof...(ts)) {
             co_return co_await detail::complete_race<0>(ridx, e0, std::forward<Trest&>(ts)...);
@@ -1631,6 +1674,14 @@ task<> race(event e0, Trest... ts) {
         ((detail::start_task(ts)), ...);
         co_await any(e0, detail::make_resolution(ts)...);
     }
+}
+
+template <typename T>
+task<T> forward(task<T> t) {
+    if (!t.done()) {
+        t.handle_.promise().forwarded_ = true;
+    }
+    return t;
 }
 
 

@@ -108,6 +108,7 @@ public:
 
 private:
     friend struct detail::task_promise<T>;
+    friend task<T> forward<>(task<T>);
     handle_type handle_;
 };
 
@@ -140,7 +141,6 @@ template <typename... Es>
 
 // first(task...) - run several tasks and return the result of the first one
 // that completes (wrapped in variant).
-
 template <typename T> struct task_return_type {};
 template <typename T> struct task_return_type<task<T>> { using type = T; };
 template <> struct task_return_type<task<void>> { using type = std::monostate; };
@@ -154,7 +154,12 @@ template <typename... Ts>
 // of the first one that completes (unwrapped).
 template <typename T, typename... Ts>
 [[nodiscard]] task<T> race(task<T>, Ts... rest);
-[[nodiscard]] inline task<> race();
+template <typename T>
+[[nodiscard]] task<T> race();
+
+// forward(t) — forward t’s resolution points into the current coroutine.
+template <typename T>
+task<T> forward(task<T> t);
 
 
 // driver
@@ -518,7 +523,9 @@ private:
 // Error codes and exception type.
 
 enum class cotamer_errc {
-    cross_driver_await = 1
+    cross_driver_await = 1,
+    detached_await = 2,
+    unreachable = 3
 };
 
 struct cotamer_error : std::logic_error {

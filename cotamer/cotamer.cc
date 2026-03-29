@@ -229,18 +229,35 @@ void reset() {
 namespace detail {
 
 bool task_promise_base::resolve() {
-    std::coroutine_handle<task_promise_base> handle = std::coroutine_handle<task_promise_base>::from_promise(*this);
-    while (!handle.done() && resolving_) {
-        if (home_ != driver::current.get()) {
-            throw cotamer_error(cotamer_errc::cross_driver_await);
+    auto handle = base_handle();
+    while (true) {
+        if (handle.done()) {
+            // coroutine has completed (NB resolving_ will be true:
+            // task_final_awaiter set it)
+            return true;
+        }
+        if (!resolving_) {
+            // unresolved or resolution revoked; clear stale resolution event
+            resolution_ = nullptr;
+            return false;
+        }
+        if (forwarded_) {
+            // this task was returned from cot::forward(), but co_await has
+            // not linked another task to it; it cannot be resolved yet
+            return false;
         }
         resolving_ = false;
-        handle();
+        // Once any cot::forward()ed awaitee has resolved, run this task to see
+        // if it can complete past its resolution point.
+        if (!forward_ || forward_->resolve()) {
+            if (home_ != driver::current.get()) {
+                throw cotamer_error(cotamer_errc::cross_driver_await);
+            }
+            in_resolve_ = true;
+            handle();
+            in_resolve_ = false;
+        }
     }
-    if (!handle.done()) {
-        resolution_ = event_handle(nullptr);
-    }
-    return handle.done();
 }
 
 }
@@ -314,6 +331,10 @@ constexpr const char* cotamer_error::message(cotamer_errc ec) noexcept {
     switch (ec) {
     case cotamer_errc::cross_driver_await:
         return "cannot co_await a task created on a different driver";
+    case cotamer_errc::detached_await:
+        return "cannot co_await a detached task";
+    case cotamer_errc::unreachable:
+        return "executing unreachable code";
     default:
         return "unknown cotamer error";
     }

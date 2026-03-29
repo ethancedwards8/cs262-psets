@@ -7,8 +7,11 @@
 //    required in order to declare the public cotamer::event class.
 
 namespace cotamer {
+class event;
+template <typename T> class task;
 class driver;
 class fd;
+template <typename T> task<T> forward(task<T>);
 namespace detail {
 struct event_body;
 struct fd_body;
