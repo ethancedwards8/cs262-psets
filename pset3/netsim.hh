@@ -215,7 +215,7 @@ auto port<T>::receive_with_id() -> cot::task<std::pair<T, std::string>> {
 
 template <typename T>
 cot::task<T> port<T>::receive() {
-    co_return (co_await receive_with_id()).first;
+    co_return (co_await cot::forward(receive_with_id())).first;
 }
 
 

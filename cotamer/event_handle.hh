@@ -7,8 +7,11 @@
 //    required in order to declare the public cotamer::event class.
 
 namespace cotamer {
+class event;
+template <typename T> class task;
 class driver;
 class fd;
+template <typename T> task<T> forward(task<T>);
 namespace detail {
 struct event_body;
 struct fd_body;
@@ -20,6 +23,7 @@ template <typename T, bool shared> struct task_mutex_event_awaiter;
 struct task_resolution_awaiter;
 struct task_final_awaiter;
 struct interest_event_awaiter;
+struct describe_task_awaiter;
 
 class event_handle {
 public:
@@ -34,6 +38,7 @@ public:
     inline ~event_handle();
 
     explicit operator bool() const noexcept { return eb_ != nullptr; }
+    inline bool triggered() const noexcept;
     inline bool empty() const noexcept;
     inline bool idle() const noexcept;
     event_body* get() const noexcept { return eb_; }
