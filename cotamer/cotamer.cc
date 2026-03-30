@@ -237,8 +237,7 @@ bool task_promise_base::resolve() {
             return true;
         }
         if (!resolving_) {
-            // unresolved or resolution revoked; clear stale resolution event
-            resolution_ = nullptr;
+            // coroutine has not reached a resolution point
             return false;
         }
         if (forwarded_) {
@@ -246,7 +245,9 @@ bool task_promise_base::resolve() {
             // not linked another task to it; it cannot be resolved yet
             return false;
         }
+        // move past resolution point and clear stale resolution event
         resolving_ = false;
+        resolution_ = nullptr;
         // Once any cot::forward()ed awaitee has resolved, run this task to see
         // if it can complete past its resolution point.
         if (!forward_ || forward_->resolve()) {
