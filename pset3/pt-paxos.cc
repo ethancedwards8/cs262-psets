@@ -151,7 +151,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
         while (ack_count < quorum_ - 1) {
             auto received = co_await cot::attempt(
                 from_replicas_.receive(),
-                cot::after(1s)
+                cot::after(200ms)
             );
 
             if (!received) {
@@ -188,6 +188,7 @@ cot::task<> pt_paxos_replica::run_as_follower() {
 
         auto* req = std::get_if<pancy::request>(&msg);
         if (req) {
+            co_await cot::after(.02s); // to make it more obvious in the viz
             co_await to_clients_.send(pancy::redirection_response{
                 pancy::response_header(*req, pancy::errc::redirect), leader_index_
             });

@@ -154,3 +154,35 @@ cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 4 -l .1
 
 I am not really sure why things were failing to work at a n=2 with 10% loss but
 I tested up to n = 8 and [1, 8] worked except for n=2.
+
+I added print statements through the code to create bad-performance-trace.txt.
+
+I also used a visualizer tool to think through whats happening:
+build/pt-paxos -n 2 -l .1 -S 289372592735 -V > output.txt
+python3 ./paxosvis.py ./output.txt > bug.html // thanks claude for the viz tool!
+
+After being confused about client redirections for a second, I ran it with -R 200
+and noticed one time (!!!!) where unlock reached 1. Hmmm. Red flag...
+
+Then I added a delay to the redirect because I was sus of it. Then confused myself
+because they overlapped with the actual requests. Eventually figured it out.
+
+Anyways, it seems that the 10% loss is just really effective. Who would've thought that
+a loss of 10% would run about 10% of the time? wow. genius me.
+
+Anyways, two cases were happening:
+the prepare was making it to the other replica but the ack never made it.
+or the prepare is sent but never makes it.
+
+In both cases, I had a 1 second delay wait before sending another message. That is probably
+too high I think? I'm not exactly sure. But because the whole simulation is limited to 100s,
+it was quickly hitting 100s without having made a transaction.
+
+This is a quirk of quorom when only 2 nodes are present. The whole protocol just
+stalls at n=2 if it cant contact another node. At n=3, though, the leader can
+reach quorom with only one response. So in order for something like this to
+happen (and it can, I tested it with -R 2000 and got a few). Its basically (I think)
+a 1% chance (because 10% * 10%). yay. fixed. pwned.
+
+200ms seemed to be okay, but that may be too low? I'm not sure. maybe this bites me in the ass.
+
