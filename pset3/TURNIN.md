@@ -226,3 +226,21 @@ but first i'm going to create a bunch of failure models (all usable via -f):
 - delayed_leader_failure
 - multiple_random_up_down
 
+anyways,
+
+for my failure detector, i will add a heartbeat message that's sent at a consistent interval
+(probably some even split of the failure detector timeout? not sure) that keeps the failure
+detector from running during periods of low client traffic. if for some reason the failure
+detector detects that it hasn't received a heartbeat or real client traffic at a given
+interval then it will assume that the leader has died and assume leadership via probes with a higher round number.
+
+we talked about this in class, though. each replica needs to have a slightly different
+failure detector length so that not all failure detectors run at one time and every single
+replica sends probes out.
+
+for impl i started by just chekcing to see if the replica receives a message from the
+heartbeat_interval_. (although i wonder if i should build in a buffer. eddie mentioned
+that time is inconsistent in the real world but i think in this virtual time world its fine.
+might be important in the next pset though? if we do real network traffic.)
+
+also just sent heartbeats every heartbeat_interval_

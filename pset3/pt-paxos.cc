@@ -1,4 +1,5 @@
 #include "lockseq_model.hh"
+#include <algorithm>
 #include <cstring>
 #include "pancydb.hh"
 #include "netsim.hh"
@@ -72,6 +73,8 @@ struct pt_paxos_replica {
     // ...plus anything you want to add
     unsigned long long next_round_ = 1;
     unsigned long long accepted_round_ = 0;
+    cot::duration heartbeat_interval_ = 200ms;
+    cot::duration failure_timeout_;
 
     pt_paxos_replica(size_t index, size_t nreplicas, random_source&);
     void initialize(pt_paxos_instance&);
@@ -102,7 +105,8 @@ pt_paxos_replica::pt_paxos_replica(size_t index, size_t nreplicas, random_source
       from_clients_(randomness, std::format("R{}", index_)),
       from_replicas_(randomness, std::format("R{}/r", index_)),
       to_clients_(randomness, from_clients_.id()),
-      to_replicas_(nreplicas) {
+      to_replicas_(nreplicas),
+      failure_timeout_(randomness.uniform(800ms, 1200ms)) {
     for (size_t s = 0UL; s != nreplicas_; ++s) {
         to_replicas_[s].reset(new netsim::channel<paxos_message>(
             randomness, from_clients_.id()
@@ -138,16 +142,35 @@ pt_paxos_instance::pt_paxos_instance(testinfo& tester, client_model& clients)
 // ********** PANCY SERVICE CODE **********
 
 cot::task<> pt_paxos_replica::run() {
-    if (index_ == leader_index_) {
-        co_await run_as_leader();
-    } else {
-        co_await run_as_follower();
+    while (true) {
+        if (index_ == leader_index_) {
+            co_await run_as_leader();
+        } else {
+            co_await run_as_follower();
+        }
     }
 }
 
 cot::task<> pt_paxos_replica::run_as_leader() {
     while (true) {
-        auto req = co_await from_clients_.receive();
+        auto received = co_await cot::attempt(
+            from_clients_.receive(),
+            cot::after(heartbeat_interval_)
+        );
+        if (!received) {
+            propose_msg heartbeat;
+            heartbeat.round = next_round_++;
+            heartbeat.leader_id = index_;
+            for (size_t s = 0; s != nreplicas_; ++s) {
+                if (s == index_)
+                    continue;
+
+                co_await to_replicas_[s]->send(heartbeat);
+            }
+            continue;
+        }
+
+        auto req = std::move(*received);
 
         propose_msg propose;
         propose.round = next_round_++;
@@ -196,7 +219,8 @@ cot::task<> pt_paxos_replica::run_as_follower() {
     while (true) {
         auto msg = co_await cot::first(
             from_clients_.receive(),
-            from_replicas_.receive()
+            from_replicas_.receive(),
+            cot::after(failure_timeout_)
         );
 
         auto* req = std::get_if<pancy::request>(&msg);
@@ -209,8 +233,11 @@ cot::task<> pt_paxos_replica::run_as_follower() {
         }
 
         auto* paxos_msg = std::get_if<paxos_message>(&msg);
-        if (!paxos_msg)
-            continue;
+        if (!paxos_msg) {
+            leader_index_ = index_;
+            next_round_ = std::max(next_round_, accepted_round_ + 1);
+            co_return;
+        }
 
         auto* propose = std::get_if<propose_msg>(paxos_msg);
         if (!propose)
@@ -371,6 +398,10 @@ int main(int argc, char* argv[]) {
                     return -1;
                 }
             } else if (strcmp(optarg, "multiple_random_up_down") == 0) {
+                if (tester.failed_replica < 0) {
+                    std::cerr << "must use -r <int> with multiple_random_up_down mode\n";
+                    return -1;
+                }
                 tester.mode = failure_mode::multiple_random_up_down;
             } else if (strcmp(optarg, "split_brain") == 0) {
                 tester.mode = failure_mode::split_brain;
