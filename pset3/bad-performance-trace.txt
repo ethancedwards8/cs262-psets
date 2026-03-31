@@ -1,0 +1,62 @@
+[R0] starting as leader (leader_index_=0, quorum=2)
+[R1] starting as follower (leader_index_=0, quorum=2)
+[R1] follower redirecting client request CAS(#4107, "g69/lock", "", "c11 8a2984d") to leader 0
+[R0] leader received client request CAS(#4107, "g69/lock", "", "c11 8a2984d")
+[R0] created prepare round 1 with 1 entry
+[R0] sending prepare round 1 to follower 1
+[R1] follower received prepare round 1 from leader 0 with 1 entries
+[R1] accepting new round 1 and applying 1 entries
+[R1] applying entry CAS(#4107, "g69/lock", "", "c11 8a2984d")
+[R1] sending ack round 1 success=true highest_accepted=1 to leader 0
+[R0] leader accepted ack 1/1 for round 1
+[R0] leader reached quorum for round 1, applying CAS(#4107, "g69/lock", "", "c11 8a2984d")
+[R0] leader replied to client for round 1
+[R0] leader received client request PUT(#8203, "g69/v000", "c11 8a2984d")
+[R0] created prepare round 2 with 1 entry
+[R0] sending prepare round 2 to follower 1
+[R1] follower received prepare round 2 from leader 0 with 1 entries
+[R1] accepting new round 2 and applying 1 entries
+[R1] applying entry PUT(#8203, "g69/v000", "c11 8a2984d")
+[R1] sending ack round 2 success=true highest_accepted=1 to leader 0
+[R1] follower redirecting client request CAS(#4119, "g31/lock", "", "c23 5345a5f") to leader 0
+[R0] leader accepted ack 1/1 for round 2
+[R0] leader reached quorum for round 2, applying PUT(#8203, "g69/v000", "c11 8a2984d")
+[R0] leader replied to client for round 2
+[R0] leader received client request CAS(#4119, "g31/lock", "", "c23 5345a5f")
+[R0] created prepare round 3 with 1 entry
+[R0] sending prepare round 3 to follower 1
+[R1] follower redirecting client request CAS(#4120, "g31/lock", "", "c24 29a2aeb") to leader 0
+[R1] follower received prepare round 3 from leader 0 with 1 entries
+[R1] accepting new round 3 and applying 1 entries
+[R1] applying entry CAS(#4119, "g31/lock", "", "c23 5345a5f")
+[R1] sending ack round 3 success=true highest_accepted=1 to leader 0
+[R0] leader accepted ack 1/1 for round 3
+[R0] leader reached quorum for round 3, applying CAS(#4119, "g31/lock", "", "c23 5345a5f")
+[R0] leader replied to client for round 3
+[R0] leader received client request PUT(#12299, "g69/v001", "c11 8a2984d")
+[R0] created prepare round 4 with 1 entry
+[R0] sending prepare round 4 to follower 1
+[R1] follower received prepare round 4 from leader 0 with 1 entries
+[R1] accepting new round 4 and applying 1 entries
+[R1] applying entry PUT(#12299, "g69/v001", "c11 8a2984d")
+[R1] sending ack round 4 success=true highest_accepted=1 to leader 0
+[R1] follower redirecting client request CAS(#4117, "g39/lock", "", "c21 6ac8ad6") to leader 0
+[R0] leader accepted ack 1/1 for round 4
+[R0] leader reached quorum for round 4, applying PUT(#12299, "g69/v001", "c11 8a2984d")
+[R0] leader replied to client for round 4
+[R0] leader received client request CAS(#4120, "g31/lock", "", "c24 29a2aeb")
+[R0] created prepare round 5 with 1 entry
+[R0] sending prepare round 5 to follower 1
+[R1] follower received prepare round 5 from leader 0 with 1 entries
+[R1] accepting new round 5 and applying 1 entries
+[R1] applying entry CAS(#4120, "g31/lock", "", "c24 29a2aeb")
+[R1] sending ack round 5 success=true highest_accepted=1 to leader 0
+[R0] leader accepted ack 1/1 for round 5
+[R0] leader reached quorum for round 5, applying CAS(#4120, "g31/lock", "", "c24 29a2aeb")
+[R0] leader replied to client for round 5
+[R0] leader received client request CAS(#4117, "g39/lock", "", "c21 6ac8ad6")
+[R0] created prepare round 6 with 1 entry
+[R0] sending prepare round 6 to follower 1
+[R1] follower redirecting client request CAS(#4124, "g79/lock", "", "c28 defd338") to leader 0
+[R1] follower redirecting client request CAS(#4126, "g81/lock", "", "c30 692ee0c") to leader 0
+
