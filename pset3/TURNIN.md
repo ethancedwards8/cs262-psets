@@ -14,6 +14,8 @@ implementation. D this bug, give a commit hash that demonstrates the bug, and
 describe how you found it and how you fixed it. Give specific pt-paxos arguments
 that demonstrate the error.
 
+Bug! See below in the Bug section in phase 2 :)
+
 
 # Notebook:
 
@@ -115,4 +117,40 @@ In order to do replica message retry, I looked at the lockseq_model.cc file and 
             }
 ```
 
-From there, I modeled my implementation similarly
+From there, I modeled my implementation similarly.
+
+Of course. I quickly hit a bug (or at least something that confuses me):
+
+My first guess is something to do with receive_with_id(). I saw the ed post, but
+I'm not sure if this is it? I think the issue is fixed based off of commit
+messages.
+
+This is visible at commit: 61a88c2bbbb1da8f447e239873c373012b707f62 
+
+```
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 3 -l .1
+42 lock, 19 write, 17 clear, 17 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 3 -l .1
+43 lock, 16 write, 16 clear, 16 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 3 -l .1
+36 lock, 11 write, 11 clear, 11 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 2 -l .1
+25 lock, 0 write, 0 clear, 0 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 2 -l .1
+28 lock, 2 write, 0 clear, 0 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 2 -l .1
+27 lock, 0 write, 0 clear, 0 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 4 -l .1
+28 lock, 7 write, 4 clear, 4 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 4 -l .1
+27 lock, 2 write, 0 clear, 0 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 4 -l .1
+25 lock, 2 write, 0 clear, 0 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 4 -l .1
+27 lock, 2 write, 0 clear, 0 unlock
+cs61-user@f27e0641ebd3:~/cs2620/pset3$ build/pt-paxos -n 4 -l .1
+26 lock, 3 write, 1 clear, 1 unlock
+```
+
+I am not really sure why things were failing to work at a n=2 with 10% loss but
+I tested up to n = 8 and [1, 8] worked except for n=2.

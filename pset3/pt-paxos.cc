@@ -160,6 +160,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
                         continue;
                     co_await to_replicas_[s]->send(prepare);
                 }
+                continue;
             }
 
             auto paxos_msg = std::move(*received);
