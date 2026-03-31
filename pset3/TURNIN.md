@@ -206,7 +206,18 @@ I have propose (combined decide), ack. and then oh shit. i realized i misnamed m
 so I will rename that real quick. oops. lmao if nothing else this is proof I'm not over-relying on AI.
 I'm guessing it would have caught that.
 
+anyways the logs i committed earlier also have this mistake so if you look at them keep that in mind.
+
+FIXED! anyways, here we go:
+i have propose and ack. yay.
+
+I also need probe and and prepare message.
+
+probe needs to only run when a leader assumes leadership (start of program or
+when leader fails or ursuption i think)
+
+prepare needs to reply and leader needs to agree that all values are equal across replicas.
 
 
-
+but first i'm going to create a bunch of failure models
 

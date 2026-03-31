@@ -1,4 +1,5 @@
 #include "lockseq_model.hh"
+#include <cstring>
 #include "pancydb.hh"
 #include "netsim.hh"
 #include "paxos.hh"
@@ -9,6 +10,15 @@ using namespace std::chrono_literals;
 // testinfo
 //    Holds configuration information about this test.
 
+enum failure_mode {
+    failed_leader,
+    failed_replica,
+    multiple_random_up_down,
+    split_brain,
+    delayed_leader_failure,
+    none,
+};
+
 struct testinfo {
     random_source randomness;
     double loss = 0.0;
@@ -16,6 +26,9 @@ struct testinfo {
     bool print_db = false;
     size_t nreplicas = 3;
     size_t initial_leader = 0;
+
+    int failed_replica = -1;
+    failure_mode mode = failure_mode::none;
 
     template <typename T>
     void configure_port(netsim::port<T>& port) {
@@ -225,6 +238,34 @@ cot::task<> pt_paxos_replica::run_as_follower() {
 
 // Test functions
 
+cot::task<> fail_primary_after(pt_paxos_instance& inst, cot::duration d) {
+    testinfo& tester = inst.tester;
+    co_await cot::after(d);
+    for (int i = 0; i < (int) tester.nreplicas; i++ ) {
+        inst.replicas[tester.initial_leader]->to_replicas_[i]->set_loss(1);
+        inst.replicas[i]->to_replicas_[tester.initial_leader]->set_loss(1);
+    }
+}
+
+cot::task<> up_down_randomly(pt_paxos_instance& inst, int replica, cot::duration d) {
+    if (replica >= (int) inst.tester.nreplicas) {
+        co_return;
+    }
+    testinfo& tester = inst.tester;
+    while (true) {
+        co_await cot::after(d);
+        for (int i = 0; i < (int) tester.nreplicas; i++ ) {
+            inst.replicas[i]->to_replicas_[replica]->set_loss(1);
+            inst.replicas[replica]->to_replicas_[i]->set_loss(1);
+        }
+        co_await cot::after(d * 2);
+        for (int i = 0; i < (int) tester.nreplicas; i++ ) {
+            inst.replicas[i]->to_replicas_[replica]->set_loss(tester.loss);
+            inst.replicas[replica]->to_replicas_[i]->set_loss(tester.loss);
+        }
+    }
+}
+
 cot::task<> clear_after(cot::duration d) {
     co_await cot::after(d);
     cot::clear();
@@ -245,6 +286,35 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         tasks.push_back(inst.replicas[s]->run());
     }
     cot::task<> timeout_task = clear_after(100s);
+
+    switch (tester.mode) {
+        case failure_mode::failed_leader:
+            for (int i = 0; i < (int) tester.nreplicas; i++ ) {
+                inst.replicas[tester.initial_leader]->to_replicas_[i]->set_loss(1);
+                inst.replicas[i]->to_replicas_[tester.initial_leader]->set_loss(1);
+            }
+            inst.clients.request_channel(tester.initial_leader).set_loss(1);
+            inst.replicas[tester.initial_leader]->to_clients_.set_loss(1);
+            break;
+        case failure_mode::failed_replica:
+            for (int i = 0; i < (int) tester.nreplicas; i++ ) {
+                inst.replicas[i]->to_replicas_[tester.failed_replica]->set_loss(1);
+                inst.replicas[tester.failed_replica]->to_replicas_[i]->set_loss(1);
+            }
+            inst.clients.request_channel(tester.failed_replica).set_loss(1);
+            inst.replicas[tester.failed_replica]->to_clients_.set_loss(1);
+            break;
+        case failure_mode::multiple_random_up_down:
+            tasks.push_back(up_down_randomly(inst, tester.failed_replica, 10s));
+            break;
+        case failure_mode::split_brain:
+            break;
+        case failure_mode::none:
+            break;
+        case failure_mode::delayed_leader_failure:
+            tasks.push_back(fail_primary_after(inst, 10s));
+            break;
+    }
 
     // Wait for `timeout_task`
     cot::loop();
@@ -275,6 +345,8 @@ static struct option options[] = {
     { "verbose", no_argument, nullptr, 'V' },
     { "print-db", no_argument, nullptr, 'p' },
     { "quiet", no_argument, nullptr, 'q' },
+    { "failure-mode", required_argument, nullptr, 'f' },
+    { "failed-replica", required_argument, nullptr, 'r' },
     { nullptr, 0, nullptr, 0 }
 };
 
@@ -299,6 +371,24 @@ int main(int argc, char* argv[]) {
             tester.verbose = true;
         } else if (ch == 'p') {
             tester.print_db = true;
+        } else if (ch == 'r') {
+            tester.failed_replica = from_str_chars<int>(optarg);
+        } else if (ch == 'f') {
+            if (strcmp(optarg, "failed_leader") == 0) {
+                tester.mode = failure_mode::failed_leader;
+            } else if (strcmp(optarg, "failed_replica") == 0) {
+                tester.mode = failure_mode::failed_replica;
+                if (tester.failed_replica < 0) {
+                    std::cerr << "must use -r <int> with failed_replica mode\n";
+                    return -1;
+                }
+            } else if (strcmp(optarg, "multiple_random_up_down") == 0) {
+                tester.mode = failure_mode::multiple_random_up_down;
+            } else if (strcmp(optarg, "split_brain") == 0) {
+                tester.mode = failure_mode::split_brain;
+            } else if (strcmp(optarg, "delayed_leader_failure") == 0) {
+                tester.mode = failure_mode::delayed_leader_failure;
+            }
         } else {
             std::print(std::cerr, "Unknown option\n");
             return 1;
