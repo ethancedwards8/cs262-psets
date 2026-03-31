@@ -15,9 +15,9 @@ describe how you found it and how you fixed it. Give specific pt-paxos arguments
 that demonstrate the error.
 
 
-Notebook:
+# Notebook:
 
-Design:
+## Phase 1 / Design:
 
 I want to think about good optimizations from the beginning in order to reduce the
 amount of churn, even if it lead to some pain during the development process.
@@ -72,6 +72,8 @@ struct ack_msg : base_message {
 }
 ```
 
+Jonathan mentioned using a Deque over a Vector for easier truncation and appending purposes
+
 Obviously the pt-paxos code assumes that these will be a single type. I wanted to avoid special c++
 features and used something like a single type with an enum to switch on logic, but it seems somewhat
 impractical? I'm not sure. Anyways, LLMs seem to think that using std::variant is the way to go.
@@ -94,3 +96,23 @@ reached, and then replies to client.
 Follower:
 
 Takes req from leader, processes it and sends ack.
+
+
+## Phase 2
+
+In order to do replica message retry, I looked at the lockseq_model.cc file and observed how it did it.
+
+```c++
+            co_await send_request<pancy::cas_request>(
+                cs.leader, serial, lock_key, "", value
+            );
+            auto resp = co_await cot::attempt(
+                receive_response<pancy::cas_response>(cs.leader, serial),
+                cot::after(randomness().normal(3s, 1s))
+            );
+            if (!resp) {
+                continue;
+            }
+```
+
+From there, I modeled my implementation similarly

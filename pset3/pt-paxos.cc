@@ -58,6 +58,7 @@ struct pt_paxos_replica {
 
     // ...plus anything you want to add
     unsigned long long next_round_ = 1;
+    unsigned long long accepted_round_ = 0;
 
     pt_paxos_replica(size_t index, size_t nreplicas, random_source&);
     void initialize(pt_paxos_instance&);
@@ -148,7 +149,20 @@ cot::task<> pt_paxos_replica::run_as_leader() {
 
         size_t ack_count = 0;
         while (ack_count < quorum_ - 1) {
-            auto paxos_msg = co_await from_replicas_.receive();
+            auto received = co_await cot::attempt(
+                from_replicas_.receive(),
+                cot::after(1s)
+            );
+
+            if (!received) {
+                for (size_t s = 0; s != nreplicas_; ++s) {
+                    if (s == index_)
+                        continue;
+                    co_await to_replicas_[s]->send(prepare);
+                }
+            }
+
+            auto paxos_msg = std::move(*received);
             auto* ack = std::get_if<ack_msg>(&paxos_msg);
 
             if (!ack)
@@ -180,23 +194,24 @@ cot::task<> pt_paxos_replica::run_as_follower() {
         }
 
         auto* paxos_msg = std::get_if<paxos_message>(&msg);
-        if (!paxos_msg) {
+        if (!paxos_msg)
             continue;
-        }
 
         auto* prepare = std::get_if<prepare_msg>(paxos_msg);
-        if (!prepare) {
+        if (!prepare)
             continue;
-        }
 
         leader_index_ = prepare->leader_id;
-        for (const auto& entry : prepare->entries) {
-            db_.process_req(entry);
+        if (prepare->round > accepted_round_) {
+            accepted_round_ = prepare->round;
+            for (const auto& entry : prepare->entries) {
+                db_.process_req(entry);
+            }
         }
 
         ack_msg ack;
         ack.round = prepare->round;
-        ack.success = true;
+        ack.success = prepare->round >= accepted_round_;
         ack.highest_accepted = prepare->batch_start + prepare->entries.size();
         co_await to_replicas_[leader_index_]->send(ack);
     }
