@@ -9,7 +9,7 @@ struct base_message {
     unsigned long long round;
 };
 
-struct prepare_msg : base_message {
+struct propose_msg : base_message {
     unsigned long long committed_slot = 0; // decide shortcut
     unsigned leader_id = 0;
 
@@ -26,19 +26,19 @@ struct ack_msg : base_message {
 };
 
 
-using paxos_message = std::variant<prepare_msg, ack_msg>;
+using paxos_message = std::variant<propose_msg, ack_msg>;
 
 
 // thanks claude for this!
 namespace std {
 
 template <typename CharT>
-struct formatter<prepare_msg, CharT> {
+struct formatter<propose_msg, CharT> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
     template <typename FormatContext>
-    auto format(const prepare_msg& m, FormatContext& ctx) const {
+    auto format(const propose_msg& m, FormatContext& ctx) const {
         return std::format_to(ctx.out(),
-            "PREPARE(round={}, leader={}, committed={}, prev=[{},{}], batch_start={}, entries={})",
+            "PROPOSE(round={}, leader={}, committed={}, prev=[{},{}], batch_start={}, entries={})",
             m.round, m.leader_id, m.committed_slot,
             m.prev_slot, m.prev_round,
             m.batch_start, m.entries.size());

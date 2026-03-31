@@ -57,6 +57,16 @@ struct base_message {
     unsigned long long round;
 }
 
+// EDIT: halfway through i realized im
+// a dumbass and this is propose i just wasn't thinking straight
+// i realize this at the beginning of phase 3.
+// but anyways leaving here for posterity
+// and for you, the grader, to laugh
+// and my dumbass.
+// anyways this is also proof
+// im not over-relying on AI
+// because I'm pretty sure it
+// would've caught this!
 struct prepare_msg : base_message {
     unsigned long long committed_slot = 0; // decide shortcut
     unsigned leader_id = 0;
@@ -185,4 +195,18 @@ happen (and it can, I tested it with -R 2000 and got a few). Its basically (I th
 a 1% chance (because 10% * 10%). yay. fixed. pwned.
 
 200ms seemed to be okay, but that may be too low? I'm not sure. maybe this bites me in the ass.
+
+With that, I think (hope, pray) that phase 2 is done.
+
+## Phase 3
+
+so this requires more message types.
+
+I have propose (combined decide), ack. and then oh shit. i realized i misnamed my propose as prepare.
+so I will rename that real quick. oops. lmao if nothing else this is proof I'm not over-relying on AI.
+I'm guessing it would have caught that.
+
+
+
+
 

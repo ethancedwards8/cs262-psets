@@ -136,15 +136,15 @@ cot::task<> pt_paxos_replica::run_as_leader() {
     while (true) {
         auto req = co_await from_clients_.receive();
 
-        prepare_msg prepare;
-        prepare.round = next_round_++;
-        prepare.leader_id = index_;
-        prepare.entries.push_back(req);
+        propose_msg propose;
+        propose.round = next_round_++;
+        propose.leader_id = index_;
+        propose.entries.push_back(req);
         for (size_t s = 0; s != nreplicas_; ++s) {
             if (s == index_)
                 continue;
 
-            co_await to_replicas_[s]->send(prepare);
+            co_await to_replicas_[s]->send(propose);
         }
 
         size_t ack_count = 0;
@@ -158,7 +158,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
                 for (size_t s = 0; s != nreplicas_; ++s) {
                     if (s == index_)
                         continue;
-                    co_await to_replicas_[s]->send(prepare);
+                    co_await to_replicas_[s]->send(propose);
                 }
                 continue;
             }
@@ -169,7 +169,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
             if (!ack)
                 continue;
 
-            if (ack->round != prepare.round || !ack->success)
+            if (ack->round != propose.round || !ack->success)
                 continue;
 
             ++ack_count;
@@ -199,22 +199,22 @@ cot::task<> pt_paxos_replica::run_as_follower() {
         if (!paxos_msg)
             continue;
 
-        auto* prepare = std::get_if<prepare_msg>(paxos_msg);
-        if (!prepare)
+        auto* propose = std::get_if<propose_msg>(paxos_msg);
+        if (!propose)
             continue;
 
-        leader_index_ = prepare->leader_id;
-        if (prepare->round > accepted_round_) {
-            accepted_round_ = prepare->round;
-            for (const auto& entry : prepare->entries) {
+        leader_index_ = propose->leader_id;
+        if (propose->round > accepted_round_) {
+            accepted_round_ = propose->round;
+            for (const auto& entry : propose->entries) {
                 db_.process_req(entry);
             }
         }
 
         ack_msg ack;
-        ack.round = prepare->round;
-        ack.success = prepare->round >= accepted_round_;
-        ack.highest_accepted = prepare->batch_start + prepare->entries.size();
+        ack.round = propose->round;
+        ack.success = propose->round >= accepted_round_;
+        ack.highest_accepted = propose->batch_start + propose->entries.size();
         co_await to_replicas_[leader_index_]->send(ack);
     }
 }
