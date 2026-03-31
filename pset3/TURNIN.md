@@ -219,5 +219,10 @@ when leader fails or ursuption i think)
 prepare needs to reply and leader needs to agree that all values are equal across replicas.
 
 
-but first i'm going to create a bunch of failure models
+but first i'm going to create a bunch of failure models (all usable via -f):
+- split_brain (WIP)
+- failed_leader
+- failed_replica
+- delayed_leader_failure
+- multiple_random_up_down
 

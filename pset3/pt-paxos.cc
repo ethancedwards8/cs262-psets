@@ -238,31 +238,29 @@ cot::task<> pt_paxos_replica::run_as_follower() {
 
 // Test functions
 
-cot::task<> fail_primary_after(pt_paxos_instance& inst, cot::duration d) {
-    testinfo& tester = inst.tester;
-    co_await cot::after(d);
-    for (int i = 0; i < (int) tester.nreplicas; i++ ) {
-        inst.replicas[tester.initial_leader]->to_replicas_[i]->set_loss(1);
-        inst.replicas[i]->to_replicas_[tester.initial_leader]->set_loss(1);
+void set_replica_channel_loss(pt_paxos_instance& inst, size_t replica, double loss) {
+    for (size_t i = 0; i < inst.tester.nreplicas; ++i) {
+        inst.replicas[replica]->to_replicas_[i]->set_loss(loss);
+        inst.replicas[i]->to_replicas_[replica]->set_loss(loss);
     }
+    inst.clients.request_channel(replica).set_loss(loss);
+    inst.replicas[replica]->to_clients_.set_loss(loss);
+}
+
+cot::task<> fail_primary_after(pt_paxos_instance& inst, cot::duration d) {
+    co_await cot::after(d);
+    set_replica_channel_loss(inst, inst.tester.initial_leader, 1);
 }
 
 cot::task<> up_down_randomly(pt_paxos_instance& inst, int replica, cot::duration d) {
     if (replica >= (int) inst.tester.nreplicas) {
         co_return;
     }
-    testinfo& tester = inst.tester;
     while (true) {
-        co_await cot::after(d);
-        for (int i = 0; i < (int) tester.nreplicas; i++ ) {
-            inst.replicas[i]->to_replicas_[replica]->set_loss(1);
-            inst.replicas[replica]->to_replicas_[i]->set_loss(1);
-        }
-        co_await cot::after(d * 2);
-        for (int i = 0; i < (int) tester.nreplicas; i++ ) {
-            inst.replicas[i]->to_replicas_[replica]->set_loss(tester.loss);
-            inst.replicas[replica]->to_replicas_[i]->set_loss(tester.loss);
-        }
+        co_await cot::after(inst.tester.randomness.uniform(d / 2, d * 3 / 2));
+        set_replica_channel_loss(inst, replica, 1);
+        co_await cot::after(inst.tester.randomness.uniform(d, d * 3));
+        set_replica_channel_loss(inst, replica, inst.tester.loss);
     }
 }
 
@@ -289,23 +287,13 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
 
     switch (tester.mode) {
         case failure_mode::failed_leader:
-            for (int i = 0; i < (int) tester.nreplicas; i++ ) {
-                inst.replicas[tester.initial_leader]->to_replicas_[i]->set_loss(1);
-                inst.replicas[i]->to_replicas_[tester.initial_leader]->set_loss(1);
-            }
-            inst.clients.request_channel(tester.initial_leader).set_loss(1);
-            inst.replicas[tester.initial_leader]->to_clients_.set_loss(1);
+            set_replica_channel_loss(inst, tester.initial_leader, 1);
             break;
         case failure_mode::failed_replica:
-            for (int i = 0; i < (int) tester.nreplicas; i++ ) {
-                inst.replicas[i]->to_replicas_[tester.failed_replica]->set_loss(1);
-                inst.replicas[tester.failed_replica]->to_replicas_[i]->set_loss(1);
-            }
-            inst.clients.request_channel(tester.failed_replica).set_loss(1);
-            inst.replicas[tester.failed_replica]->to_clients_.set_loss(1);
+            set_replica_channel_loss(inst, tester.failed_replica, 1);
             break;
         case failure_mode::multiple_random_up_down:
-            tasks.push_back(up_down_randomly(inst, tester.failed_replica, 10s));
+            tasks.push_back(up_down_randomly(inst, tester.failed_replica, 3s));
             break;
         case failure_mode::split_brain:
             break;
