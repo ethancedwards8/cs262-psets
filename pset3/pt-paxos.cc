@@ -83,6 +83,7 @@ struct pt_paxos_replica {
     cot::task<> run();
     cot::task<> run_as_leader();
     cot::task<> run_as_follower();
+    cot::task<> send_to_other_replicas(const paxos_message& msg);
 
 private: 
     unsigned long quorum_ = nreplicas_ / 2 + 1;
@@ -152,16 +153,20 @@ cot::task<> pt_paxos_replica::run() {
     }
 }
 
-cot::task<> pt_paxos_replica::run_as_leader() {
-    probe_msg probe;
-    probe.round = next_round_++;
-    probe.leader_id = index_;
+cot::task<> pt_paxos_replica::send_to_other_replicas(const paxos_message& msg) {
     for (size_t s = 0; s != nreplicas_; ++s) {
         if (s == index_)
             continue;
 
-        co_await to_replicas_[s]->send(probe);
+        co_await to_replicas_[s]->send(msg);
     }
+}
+
+cot::task<> pt_paxos_replica::run_as_leader() {
+    probe_msg probe;
+    probe.round = next_round_++;
+    probe.leader_id = index_;
+    co_await send_to_other_replicas(probe);
 
     size_t prepare_count = 0;
     unsigned long long highest_accepted_round = accepted_round_;
@@ -173,12 +178,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
         );
 
         if (!received) {
-            for (size_t s = 0; s != nreplicas_; ++s) {
-                if (s == index_) {
-                    continue;
-                }
-                co_await to_replicas_[s]->send(probe);
-            }
+            co_await send_to_other_replicas(probe);
             continue;
         }
 
@@ -214,12 +214,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
             propose_msg heartbeat;
             heartbeat.round = next_round_++;
             heartbeat.leader_id = index_;
-            for (size_t s = 0; s != nreplicas_; ++s) {
-                if (s == index_)
-                    continue;
-
-                co_await to_replicas_[s]->send(heartbeat);
-            }
+            co_await send_to_other_replicas(heartbeat);
             continue;
         }
 
@@ -231,12 +226,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
         propose.entries.push_back(req);
         accepted_round_ = propose.round;
         accepted_values_ = propose.entries;
-        for (size_t s = 0; s != nreplicas_; ++s) {
-            if (s == index_)
-                continue;
-
-            co_await to_replicas_[s]->send(propose);
-        }
+        co_await send_to_other_replicas(propose);
 
         size_t ack_count = 0;
         while (ack_count < quorum_ - 1) {
@@ -246,11 +236,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
             );
 
             if (!received) {
-                for (size_t s = 0; s != nreplicas_; ++s) {
-                    if (s == index_)
-                        continue;
-                    co_await to_replicas_[s]->send(propose);
-                }
+                co_await send_to_other_replicas(propose);
                 continue;
             }
 
