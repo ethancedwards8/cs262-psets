@@ -5,28 +5,25 @@
 #include "pancy_msgs.hh"
 
 
+// amalgamation of https://read.seas.harvard.edu/cs2620/2026/lectures/multi-paxos/
+// and raft's log replication protocol
 struct base_message {
-    unsigned long long round;
-};
-
-struct propose_msg : base_message {
-    unsigned long long committed_slot = 0; // decide shortcut
-    unsigned leader_id = 0;
-
-    unsigned long long prev_slot;
-    unsigned long long prev_round;
-
-    unsigned long long batch_start = 0;
-    std::deque<pancy::request> entries; // empty = raft heartbeat keepalive
+    unsigned long long round = 0;
 };
 
 struct probe_msg : base_message {
-    unsigned leader_id = 0;
+    // round number only (inherited)
 };
 
 struct prepare_msg : base_message {
     unsigned long long accepted_round = 0;
     std::deque<pancy::request> accepted_values;
+};
+
+struct propose_msg : base_message {
+    unsigned long long committed_slot = 0; // decide shortcut
+    unsigned long long batch_start = 0;
+    std::deque<pancy::request> entries; // empty = raft heartbeat keepalive
 };
 
 struct ack_msg : base_message {
@@ -47,9 +44,8 @@ struct formatter<propose_msg, CharT> {
     template <typename FormatContext>
     auto format(const propose_msg& m, FormatContext& ctx) const {
         return std::format_to(ctx.out(),
-            "PROPOSE(round={}, leader={}, committed={}, prev=[{},{}], batch_start={}, entries={})",
-            m.round, m.leader_id, m.committed_slot,
-            m.prev_slot, m.prev_round,
+            "PROPOSE(round={}, committed={}, batch_start={}, entries={})",
+            m.round, m.committed_slot,
             m.batch_start, m.entries.size());
     }
 };
@@ -71,8 +67,8 @@ struct formatter<probe_msg, CharT> {
     template <typename FormatContext>
     auto format(const probe_msg& m, FormatContext& ctx) const {
         return std::format_to(ctx.out(),
-            "PROBE(round={}, leader={})",
-            m.round, m.leader_id);
+            "PROBE(round={})",
+            m.round);
     }
 };
 

@@ -98,6 +98,10 @@ struct pt_paxos_instance {
     pt_paxos_instance(testinfo&, client_model&);
 };
 
+static size_t replica_index_from_source_id(const std::string& source_id) {
+    return from_str_chars<size_t>(source_id.substr(1));
+}
+
 
 // Configuration and initialization
 
@@ -165,7 +169,6 @@ cot::task<> pt_paxos_replica::send_to_other_replicas(const paxos_message& msg) {
 cot::task<> pt_paxos_replica::run_as_leader() {
     probe_msg probe;
     probe.round = next_round_++;
-    probe.leader_id = index_;
 
     co_await send_to_other_replicas(probe);
 
@@ -214,7 +217,6 @@ cot::task<> pt_paxos_replica::run_as_leader() {
         if (!received) {
             propose_msg heartbeat;
             heartbeat.round = next_round_++;
-            heartbeat.leader_id = index_;
             co_await send_to_other_replicas(heartbeat);
             continue;
         }
@@ -223,7 +225,6 @@ cot::task<> pt_paxos_replica::run_as_leader() {
 
         propose_msg propose;
         propose.round = next_round_++;
-        propose.leader_id = index_;
         propose.entries.push_back(req);
         accepted_round_ = propose.round;
         accepted_values_ = propose.entries;
@@ -261,7 +262,7 @@ cot::task<> pt_paxos_replica::run_as_follower() {
     while (true) {
         auto msg = co_await cot::first(
             from_clients_.receive(),
-            from_replicas_.receive(),
+            from_replicas_.receive_with_id(),
             cot::after(failure_timeout_)
         );
 
@@ -274,16 +275,19 @@ cot::task<> pt_paxos_replica::run_as_follower() {
             continue;
         }
 
-        auto* paxos_msg = std::get_if<paxos_message>(&msg);
-        if (!paxos_msg) {
+        auto* received = std::get_if<std::pair<paxos_message, std::string>>(&msg);
+        if (!received) {
             leader_index_ = index_;
             next_round_ = std::max(next_round_, accepted_round_ + 1);
             co_return;
         }
 
-        auto* propose = std::get_if<propose_msg>(paxos_msg);
+        auto& [paxos_msg, source_id] = *received;
+        size_t sender_index = replica_index_from_source_id(source_id);
+
+        auto* propose = std::get_if<propose_msg>(&paxos_msg);
         if (!propose) {
-            auto* probe = std::get_if<probe_msg>(paxos_msg);
+            auto* probe = std::get_if<probe_msg>(&paxos_msg);
             if (!probe)
                 continue;
 
@@ -291,13 +295,11 @@ cot::task<> pt_paxos_replica::run_as_follower() {
             prepare.round = probe->round;
             prepare.accepted_round = accepted_round_;
             prepare.accepted_values = accepted_values_;
-            co_await to_replicas_[probe->leader_id]->send(prepare);
+            co_await to_replicas_[sender_index]->send(prepare);
             continue;
         }
 
-
-
-        leader_index_ = propose->leader_id;
+        leader_index_ = sender_index;
         if (propose->round > accepted_round_) {
             accepted_round_ = propose->round;
             accepted_values_ = propose->entries;
