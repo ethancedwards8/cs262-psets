@@ -263,4 +263,46 @@ struct prepare_msg : base_message {
 }
 ```
 
+At this point I feel pretty confident in my implementation and now I will try and break it.
 
+Also there are a number of optimizations that my rpc supports that I haven't actually implemented yet like truncating the log.
+
+And here I realized another bug fairly quickly.
+
+Commit: d4532b9992d3ad7901bf5f9401c94bb7c3a2d298
+
+```
+build/pt-paxos -n 3 -r 2 -f multiple_random_up_down -S 2636664949796318461
+131 lock, 120 write, 119 clear, 119 unlock
+*** REPLICA DIVERGENCE on seed 2636664949796318461 between replica 0 and 1 at key g73/v003
+   ...
+   g72/v058 [V6088] c31 25ad5f7
+   g73/lock [V7409] c25 c7e3c2b
+   g73/v000 [V7419] c25 c7e3c2b
+   g73/v001 [V7429] c25 c7e3c2b
+   g73/v002 [V7441] c25 c7e3c2b
+   g74/v000 [V5108] c18 c92ca56
+   g74/v001 [V5125] c18 c92ca56
+   g74/v002 [V5141] c18 c92ca56
+   g74/v003 [V5159] c18 c92ca56
+   g74/v004 [V5174] c18 c92ca56
+   g74/v005 [V5191] c18 c92ca56
+   ...
+   ...
+   g72/v058 [V6088] c31 25ad5f7
+   g73/lock [V7409] c25 c7e3c2b
+   g73/v000 [V7419] c25 c7e3c2b
+   g73/v001 [V7429] c25 c7e3c2b
+   g73/v002 [V7441] c25 c7e3c2b
+ * g73/v003 [V7453] c25 c7e3c2b
+   g74/v000 [V5108] c18 c92ca56
+   g74/v001 [V5125] c18 c92ca56
+   g74/v002 [V5141] c18 c92ca56
+   g74/v003 [V5159] c18 c92ca56
+   g74/v004 [V5174] c18 c92ca56
+   ...
+```
+
+Basically what was happening is that I was not correctly truncating the log
+after processing and the prepare messages being sent after a leader failover
+were all being applied (from 0 to n entries). basically just a bunch of redoing.

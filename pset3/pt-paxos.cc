@@ -166,6 +166,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
     probe_msg probe;
     probe.round = next_round_++;
     probe.leader_id = index_;
+
     co_await send_to_other_replicas(probe);
 
     size_t prepare_count = 0;
@@ -393,6 +394,21 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
                clients.lock_complete, clients.write_complete,
                clients.clear_complete, clients.unlock_complete);
     pancy::pancydb& db = inst.replicas[tester.initial_leader]->db_;
+
+    for (size_t s = 0; s != tester.nreplicas; ++s) {
+        if (s == tester.initial_leader)
+            continue;
+        auto problem = db.diff(inst.replicas[s]->db_);
+        if (problem) {
+            std::print(std::clog,
+                       "*** REPLICA DIVERGENCE on seed {} between replica {} and {} at key {}\n",
+                       seed, tester.initial_leader, s, *problem);
+            db.print_near(*problem, std::clog);
+            inst.replicas[s]->db_.print_near(*problem, std::clog);
+            return false;
+        }
+    }
+
     if (auto problem = clients.check(db)) {
         std::print(std::clog, "*** FAILURE on seed {} at key {}\n", seed, *problem);
         db.print_near(*problem, std::clog);
