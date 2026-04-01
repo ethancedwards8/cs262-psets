@@ -73,6 +73,7 @@ struct pt_paxos_replica {
     // ...plus anything you want to add
     unsigned long long next_round_ = 1;
     unsigned long long accepted_round_ = 0;
+    std::deque<pancy::request> accepted_values_;
     cot::duration heartbeat_interval_ = 200ms;
     cot::duration failure_timeout_;
 
@@ -152,6 +153,58 @@ cot::task<> pt_paxos_replica::run() {
 }
 
 cot::task<> pt_paxos_replica::run_as_leader() {
+    probe_msg probe;
+    probe.round = next_round_++;
+    probe.leader_id = index_;
+    for (size_t s = 0; s != nreplicas_; ++s) {
+        if (s == index_)
+            continue;
+
+        co_await to_replicas_[s]->send(probe);
+    }
+
+    size_t prepare_count = 0;
+    unsigned long long highest_accepted_round = accepted_round_;
+    std::deque<pancy::request> highest_accepted_values = accepted_values_;
+    while (prepare_count < quorum_ - 1) {
+        auto received = co_await cot::attempt(
+            from_replicas_.receive(),
+            cot::after(200ms)
+        );
+
+        if (!received) {
+            for (size_t s = 0; s != nreplicas_; ++s) {
+                if (s == index_) {
+                    continue;
+                }
+                co_await to_replicas_[s]->send(probe);
+            }
+            continue;
+        }
+
+        auto paxos_msg = std::move(*received);
+        auto* prepare = std::get_if<prepare_msg>(&paxos_msg);
+        if (!prepare)
+            continue;
+
+        if (prepare->round != probe.round)
+            continue;
+
+        if (prepare->accepted_round > highest_accepted_round) {
+            highest_accepted_round = prepare->accepted_round;
+            highest_accepted_values = prepare->accepted_values;
+        }
+        ++prepare_count;
+    }
+
+    if (highest_accepted_round > accepted_round_) {
+        accepted_round_ = highest_accepted_round;
+        accepted_values_ = highest_accepted_values;
+        for (const auto& entry : accepted_values_) {
+            db_.process_req(entry);
+        }
+    }
+
     while (true) {
         auto received = co_await cot::attempt(
             from_clients_.receive(),
@@ -176,6 +229,8 @@ cot::task<> pt_paxos_replica::run_as_leader() {
         propose.round = next_round_++;
         propose.leader_id = index_;
         propose.entries.push_back(req);
+        accepted_round_ = propose.round;
+        accepted_values_ = propose.entries;
         for (size_t s = 0; s != nreplicas_; ++s) {
             if (s == index_)
                 continue;
@@ -240,12 +295,25 @@ cot::task<> pt_paxos_replica::run_as_follower() {
         }
 
         auto* propose = std::get_if<propose_msg>(paxos_msg);
-        if (!propose)
+        if (!propose) {
+            auto* probe = std::get_if<probe_msg>(paxos_msg);
+            if (!probe)
+                continue;
+
+            prepare_msg prepare;
+            prepare.round = probe->round;
+            prepare.accepted_round = accepted_round_;
+            prepare.accepted_values = accepted_values_;
+            co_await to_replicas_[probe->leader_id]->send(prepare);
             continue;
+        }
+
+
 
         leader_index_ = propose->leader_id;
         if (propose->round > accepted_round_) {
             accepted_round_ = propose->round;
+            accepted_values_ = propose->entries;
             for (const auto& entry : propose->entries) {
                 db_.process_req(entry);
             }

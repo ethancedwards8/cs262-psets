@@ -234,6 +234,9 @@ detector from running during periods of low client traffic. if for some reason t
 detector detects that it hasn't received a heartbeat or real client traffic at a given
 interval then it will assume that the leader has died and assume leadership via probes with a higher round number.
 
+after probes are recv and prepares are sent back to the replica that sent the probes, then
+the new leader takes the highest round
+
 we talked about this in class, though. each replica needs to have a slightly different
 failure detector length so that not all failure detectors run at one time and every single
 replica sends probes out.
@@ -243,4 +246,21 @@ heartbeat_interval_. (although i wonder if i should build in a buffer. eddie men
 that time is inconsistent in the real world but i think in this virtual time world its fine.
 might be important in the next pset though? if we do real network traffic.)
 
-also just sent heartbeats every heartbeat_interval_
+also just sent heartbeats every heartbeat_interval_.
+
+for explicit probe and prepare types:
+
+```c++
+// l -> f
+struct probe_msg : base_message {
+    unsigned leader_id = 0;
+};
+
+// f -> l
+struct prepare_msg : base_message {
+    unsigned long long accepted_round;
+    std::deque<pancy::request> accepted_values;
+}
+```
+
+

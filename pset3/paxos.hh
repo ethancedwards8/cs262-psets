@@ -20,16 +20,25 @@ struct propose_msg : base_message {
     std::deque<pancy::request> entries; // empty = raft heartbeat keepalive
 };
 
+struct probe_msg : base_message {
+    unsigned leader_id = 0;
+};
+
+struct prepare_msg : base_message {
+    unsigned long long accepted_round = 0;
+    std::deque<pancy::request> accepted_values;
+};
+
 struct ack_msg : base_message {
     bool success = false;
     unsigned long long highest_accepted = 0;
 };
 
 
-using paxos_message = std::variant<propose_msg, ack_msg>;
+using paxos_message = std::variant<propose_msg, probe_msg, prepare_msg, ack_msg>;
 
 
-// thanks claude for this!
+// thanks claude for these!
 namespace std {
 
 template <typename CharT>
@@ -53,6 +62,28 @@ struct formatter<ack_msg, CharT> {
         return std::format_to(ctx.out(),
             "ACK(round={}, success={}, highest_accepted={})",
             m.round, m.success, m.highest_accepted);
+    }
+};
+
+template <typename CharT>
+struct formatter<probe_msg, CharT> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(const probe_msg& m, FormatContext& ctx) const {
+        return std::format_to(ctx.out(),
+            "PROBE(round={}, leader={})",
+            m.round, m.leader_id);
+    }
+};
+
+template <typename CharT>
+struct formatter<prepare_msg, CharT> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(const prepare_msg& m, FormatContext& ctx) const {
+        return std::format_to(ctx.out(),
+            "PREPARE(round={}, accepted_round={}, accepted_values={})",
+            m.round, m.accepted_round, m.accepted_values.size());
     }
 };
 
