@@ -152,7 +152,12 @@ cot::task<> channel<T>::send(message_type m) {
         }
 
         // after `link_delay_`, place the message in the receiver’s queue
-        send_after(link_delay_, std::move(m)).detach();
+        cot::duration delay = link_delay_;
+        if (loss_ > 0.0) {
+            delay += randomness_.exponential(700ms);
+            delay += randomness_.uniform(0ms, 100ms);
+        }
+        send_after(delay, std::move(m)).detach();
     }
 
     // sending a message takes time
