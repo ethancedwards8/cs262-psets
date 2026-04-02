@@ -106,6 +106,12 @@ static size_t replica_index_from_source_id(const std::string& source_id) {
     return from_str_chars<size_t>(source_id.substr(1));
 }
 
+static unsigned long long message_round(const paxos_message& msg) {
+    return std::visit([](const auto& m) {
+        return m.round;
+    }, msg);
+}
+
 
 // Configuration and initialization
 
@@ -197,6 +203,13 @@ cot::task<> pt_paxos_replica::run_as_leader() {
         }
 
         auto& [paxos_msg, source_id] = *received;
+        if (message_round(paxos_msg) > probe.round) {
+            accepted_round_ = message_round(paxos_msg);
+            next_round_ = std::max(next_round_, accepted_round_ + 1);
+            leader_index_ = replica_index_from_source_id(source_id);
+            co_return;
+        }
+
         auto* prepare = std::get_if<prepare_msg>(&paxos_msg);
         if (!prepare)
             continue;
@@ -266,6 +279,13 @@ cot::task<> pt_paxos_replica::run_as_leader() {
             }
 
             auto& [paxos_msg, source_id] = *ack_received;
+            if (message_round(paxos_msg) > propose.round) {
+                accepted_round_ = message_round(paxos_msg);
+                next_round_ = std::max(next_round_, accepted_round_ + 1);
+                leader_index_ = replica_index_from_source_id(source_id);
+                co_return;
+            }
+
             auto* ack = std::get_if<ack_msg>(&paxos_msg);
 
             if (!ack)
@@ -349,12 +369,22 @@ cot::task<> pt_paxos_replica::run_as_follower() {
 
         auto& [paxos_msg, source_id] = *received;
         size_t sender_index = replica_index_from_source_id(source_id);
+        unsigned long long incoming_round = message_round(paxos_msg);
+
+        if (incoming_round > accepted_round_) {
+            accepted_round_ = incoming_round;
+            next_round_ = std::max(next_round_, accepted_round_ + 1);
+        }
 
         auto* propose = std::get_if<propose_msg>(&paxos_msg);
         if (!propose) {
             auto* probe = std::get_if<probe_msg>(&paxos_msg);
             if (!probe)
                 continue;
+
+            if (probe->round < accepted_round_) {
+                continue;
+            }
 
             prepare_msg prepare;
             prepare.round = probe->round;
@@ -410,6 +440,30 @@ void set_replica_channel_loss(pt_paxos_instance& inst, size_t replica, double lo
     inst.replicas[replica]->to_clients_.set_loss(loss);
 }
 
+void set_partition_loss(pt_paxos_instance& inst,
+                        const std::vector<size_t>& left,
+                        const std::vector<size_t>& right,
+                        double loss) {
+    for (size_t l : left) {
+        for (size_t r : right) {
+            inst.replicas[l]->to_replicas_[r]->set_loss(loss);
+            inst.replicas[r]->to_replicas_[l]->set_loss(loss);
+        }
+    }
+}
+
+void apply_split_brain(pt_paxos_instance& inst) {
+    std::vector<size_t> minority{inst.tester.initial_leader};
+    std::vector<size_t> majority;
+    majority.reserve(inst.tester.nreplicas - 1);
+    for (size_t i = 0; i != inst.tester.nreplicas; ++i) {
+        if (i != inst.tester.initial_leader) {
+            majority.push_back(i);
+        }
+    }
+    set_partition_loss(inst, minority, majority, 1);
+}
+
 cot::task<> fail_primary_after(pt_paxos_instance& inst, cot::duration d) {
     co_await cot::after(d);
     set_replica_channel_loss(inst, inst.tester.initial_leader, 1);
@@ -459,6 +513,7 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
             tasks.push_back(up_down_randomly(inst, tester.failed_replica, 3s));
             break;
         case failure_mode::split_brain:
+            apply_split_brain(inst);
             break;
         case failure_mode::none:
             break;
@@ -475,7 +530,8 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
                clients.lock_complete, clients.write_complete,
                clients.clear_complete, clients.unlock_complete);
     size_t reference = tester.initial_leader;
-    if (tester.mode == failure_mode::failed_leader)
+    if (tester.mode == failure_mode::failed_leader
+        || tester.mode == failure_mode::split_brain)
         reference = (tester.initial_leader + 1) % tester.nreplicas;
     pancy::pancydb& db = inst.replicas[reference]->db_;
 
@@ -486,6 +542,10 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
             continue;
         if (tester.mode == failure_mode::failed_replica
             && s == (size_t) tester.failed_replica)
+            continue;
+        if (tester.mode == failure_mode::delayed_leader_failure && s == tester.initial_leader)
+            continue;
+        if (tester.mode == failure_mode::split_brain && s == tester.initial_leader)
             continue;
         auto problem = db.diff(inst.replicas[s]->db_, 5);
         if (problem) {

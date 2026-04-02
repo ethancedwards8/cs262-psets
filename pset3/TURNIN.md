@@ -306,3 +306,14 @@ build/pt-paxos -n 3 -r 2 -f multiple_random_up_down -S 2636664949796318461
 Basically what was happening is that I was not correctly truncating the log
 after processing and the prepare messages being sent after a leader failover
 were all being applied (from 0 to n entries). basically just a bunch of redoing.
+
+i ended up adding an extra field in prepare and ack to make calculating the truncation
+boundaries easier.
+
+in any case, the impl in sum is pretty close to 
+https://read.seas.harvard.edu/cs2620/2026/lectures/multi-paxos/
+
+I followed it pretty closely but mapped an interesting raft optimization onto the probe/prep/prop/ack
+message types defined by eddie's notes.
+
+## phase 4
