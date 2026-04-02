@@ -74,6 +74,10 @@ struct pt_paxos_replica {
     unsigned long long next_round_ = 1;
     unsigned long long accepted_round_ = 0;
     std::deque<pancy::request> accepted_values_;
+    unsigned long long commit_index_ = 0;
+    unsigned long long applied_index_ = 0;
+    std::vector<unsigned long long> match_index_;
+    std::vector<unsigned long long> applied_up_to_;
     cot::duration heartbeat_interval_ = 200ms;
     cot::duration failure_timeout_;
 
@@ -112,6 +116,8 @@ pt_paxos_replica::pt_paxos_replica(size_t index, size_t nreplicas, random_source
       from_replicas_(randomness, std::format("R{}/r", index_)),
       to_clients_(randomness, from_clients_.id()),
       to_replicas_(nreplicas),
+      match_index_(nreplicas, 0),
+      applied_up_to_(nreplicas, 0),
       failure_timeout_(randomness.uniform(800ms, 1200ms)) {
     for (size_t s = 0UL; s != nreplicas_; ++s) {
         to_replicas_[s].reset(new netsim::channel<paxos_message>(
@@ -172,12 +178,16 @@ cot::task<> pt_paxos_replica::run_as_leader() {
 
     co_await send_to_other_replicas(probe);
 
+    std::fill(match_index_.begin(), match_index_.end(), 0);
+    std::fill(applied_up_to_.begin(), applied_up_to_.end(), 0);
+
+    std::vector<bool> prepared(nreplicas_, false);
     size_t prepare_count = 0;
     unsigned long long highest_accepted_round = accepted_round_;
     std::deque<pancy::request> highest_accepted_values = accepted_values_;
     while (prepare_count < quorum_ - 1) {
         auto received = co_await cot::attempt(
-            from_replicas_.receive(),
+            from_replicas_.receive_with_id(),
             cot::after(200ms)
         );
 
@@ -186,13 +196,20 @@ cot::task<> pt_paxos_replica::run_as_leader() {
             continue;
         }
 
-        auto paxos_msg = std::move(*received);
+        auto& [paxos_msg, source_id] = *received;
         auto* prepare = std::get_if<prepare_msg>(&paxos_msg);
         if (!prepare)
             continue;
 
         if (prepare->round != probe.round)
             continue;
+
+        size_t sender_index = replica_index_from_source_id(source_id);
+        if (prepared[sender_index])
+            continue;
+
+        prepared[sender_index] = true;
+        applied_up_to_[sender_index] = prepare->applied_up_to;
 
         if (prepare->accepted_round > highest_accepted_round) {
             highest_accepted_round = prepare->accepted_round;
@@ -201,48 +218,54 @@ cot::task<> pt_paxos_replica::run_as_leader() {
         ++prepare_count;
     }
 
+    // Adopt highest accepted values but do NOT apply to db yet
     if (highest_accepted_round > accepted_round_) {
         accepted_round_ = highest_accepted_round;
         accepted_values_ = highest_accepted_values;
-        for (const auto& entry : accepted_values_) {
-            db_.process_req(entry);
-        }
     }
+    match_index_[index_] = accepted_values_.size();
+    applied_up_to_[index_] = applied_index_;
+
+    std::deque<unsigned long long> pending_client_slots;
+    std::deque<pancy::response> ready_client_responses;
+    const size_t follower_quorum = quorum_ > 0 ? quorum_ - 1 : 0;
 
     while (true) {
         auto received = co_await cot::attempt(
             from_clients_.receive(),
             cot::after(heartbeat_interval_)
         );
-        if (!received) {
-            propose_msg heartbeat;
-            heartbeat.round = next_round_++;
-            co_await send_to_other_replicas(heartbeat);
-            continue;
-        }
-
-        auto req = std::move(*received);
 
         propose_msg propose;
         propose.round = next_round_++;
-        propose.entries.push_back(req);
-        accepted_round_ = propose.round;
-        accepted_values_ = propose.entries;
+        propose.batch_start = accepted_values_.size();
+        propose.committed_slot = commit_index_;
+
+        if (received) {
+            auto req = std::move(*received);
+            pending_client_slots.push_back(propose.batch_start);
+            accepted_values_.push_back(req);
+            propose.entries.push_back(req);
+            accepted_round_ = propose.round;
+            match_index_[index_] = accepted_values_.size();
+        }
+
         co_await send_to_other_replicas(propose);
 
+        std::vector<bool> acked(nreplicas_, false);
         size_t ack_count = 0;
-        while (ack_count < quorum_ - 1) {
-            auto received = co_await cot::attempt(
-                from_replicas_.receive(),
+        while (ack_count < follower_quorum) {
+            auto ack_received = co_await cot::attempt(
+                from_replicas_.receive_with_id(),
                 cot::after(200ms)
             );
 
-            if (!received) {
+            if (!ack_received) {
                 co_await send_to_other_replicas(propose);
                 continue;
             }
 
-            auto paxos_msg = std::move(*received);
+            auto& [paxos_msg, source_id] = *ack_received;
             auto* ack = std::get_if<ack_msg>(&paxos_msg);
 
             if (!ack)
@@ -251,10 +274,52 @@ cot::task<> pt_paxos_replica::run_as_leader() {
             if (ack->round != propose.round || !ack->success)
                 continue;
 
+            size_t sender_index = replica_index_from_source_id(source_id);
+            if (acked[sender_index])
+                continue;
+
+            acked[sender_index] = true;
+            match_index_[sender_index] = ack->highest_accepted;
+            applied_up_to_[sender_index] = ack->applied_up_to;
+
             ++ack_count;
         }
 
-        co_await to_clients_.send(db_.process_req(req));
+        // Compute new commit index: highest index a quorum has reached
+        auto sorted = match_index_;
+        std::sort(sorted.begin(), sorted.end());
+        commit_index_ = sorted[nreplicas_ - quorum_];
+
+        unsigned long long new_applied = commit_index_;
+        if (nreplicas_ > 1) {
+            std::vector<unsigned long long> follower_applied;
+            follower_applied.reserve(nreplicas_ - 1);
+            for (size_t i = 0; i != nreplicas_; ++i) {
+                if (i != index_) {
+                    follower_applied.push_back(applied_up_to_[i]);
+                }
+            }
+            std::sort(follower_applied.begin(), follower_applied.end());
+            new_applied = std::min(
+                commit_index_,
+                follower_applied[follower_applied.size() - follower_quorum]
+            );
+        }
+
+        for (auto i = applied_index_; i < new_applied; ++i) {
+            auto resp = db_.process_req(accepted_values_[i]);
+            if (!pending_client_slots.empty() && pending_client_slots.front() == i) {
+                ready_client_responses.push_back(std::move(resp));
+                pending_client_slots.pop_front();
+            }
+        }
+        applied_index_ = new_applied;
+        applied_up_to_[index_] = applied_index_;
+
+        while (!ready_client_responses.empty()) {
+            co_await to_clients_.send(std::move(ready_client_responses.front()));
+            ready_client_responses.pop_front();
+        }
     }
 }
 
@@ -294,24 +359,38 @@ cot::task<> pt_paxos_replica::run_as_follower() {
             prepare_msg prepare;
             prepare.round = probe->round;
             prepare.accepted_round = accepted_round_;
+            prepare.applied_up_to = commit_index_;
             prepare.accepted_values = accepted_values_;
             co_await to_replicas_[sender_index]->send(prepare);
             continue;
         }
 
         leader_index_ = sender_index;
-        if (propose->round > accepted_round_) {
-            accepted_round_ = propose->round;
-            accepted_values_ = propose->entries;
-            for (const auto& entry : propose->entries) {
-                db_.process_req(entry);
+
+        // Reject stale messages (e.g., old heartbeats arriving after newer proposes)
+        if (propose->round < accepted_round_) {
+            continue;
+        }
+
+        bool no_gap = propose->batch_start <= accepted_values_.size();
+        if (no_gap) {
+            accepted_values_.resize(propose->batch_start);
+            for (const auto& e : propose->entries) {
+                accepted_values_.push_back(e);
             }
+            accepted_round_ = propose->round;
+
+            for (auto i = commit_index_; i < propose->committed_slot && i < accepted_values_.size(); ++i) {
+                db_.process_req(accepted_values_[i]);
+            }
+            commit_index_ = std::min(propose->committed_slot, (unsigned long long)accepted_values_.size());
         }
 
         ack_msg ack;
         ack.round = propose->round;
-        ack.success = propose->round >= accepted_round_;
-        ack.highest_accepted = propose->batch_start + propose->entries.size();
+        ack.success = no_gap;
+        ack.highest_accepted = accepted_values_.size();
+        ack.applied_up_to = commit_index_;
         co_await to_replicas_[leader_index_]->send(ack);
     }
 }
@@ -395,12 +474,20 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
     std::print("{} lock, {} write, {} clear, {} unlock\n",
                clients.lock_complete, clients.write_complete,
                clients.clear_complete, clients.unlock_complete);
-    pancy::pancydb& db = inst.replicas[tester.initial_leader]->db_;
+    size_t reference = tester.initial_leader;
+    if (tester.mode == failure_mode::failed_leader)
+        reference = (tester.initial_leader + 1) % tester.nreplicas;
+    pancy::pancydb& db = inst.replicas[reference]->db_;
 
     for (size_t s = 0; s != tester.nreplicas; ++s) {
-        if (s == tester.initial_leader)
+        if (s == reference)
             continue;
-        auto problem = db.diff(inst.replicas[s]->db_);
+        if (tester.mode == failure_mode::failed_leader && s == tester.initial_leader)
+            continue;
+        if (tester.mode == failure_mode::failed_replica
+            && s == (size_t) tester.failed_replica)
+            continue;
+        auto problem = db.diff(inst.replicas[s]->db_, 5);
         if (problem) {
             std::print(std::clog,
                        "*** REPLICA DIVERGENCE on seed {} between replica {} and {} at key {}\n",

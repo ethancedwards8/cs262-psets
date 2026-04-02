@@ -17,6 +17,7 @@ struct probe_msg : base_message {
 
 struct prepare_msg : base_message {
     unsigned long long accepted_round = 0;
+    unsigned long long applied_up_to = 0;
     std::deque<pancy::request> accepted_values;
 };
 
@@ -29,6 +30,7 @@ struct propose_msg : base_message {
 struct ack_msg : base_message {
     bool success = false;
     unsigned long long highest_accepted = 0;
+    unsigned long long applied_up_to = 0;
 };
 
 
@@ -56,8 +58,8 @@ struct formatter<ack_msg, CharT> {
     template <typename FormatContext>
     auto format(const ack_msg& m, FormatContext& ctx) const {
         return std::format_to(ctx.out(),
-            "ACK(round={}, success={}, highest_accepted={})",
-            m.round, m.success, m.highest_accepted);
+            "ACK(round={}, success={}, highest_accepted={}, applied_up_to={})",
+            m.round, m.success, m.highest_accepted, m.applied_up_to);
     }
 };
 
@@ -78,8 +80,8 @@ struct formatter<prepare_msg, CharT> {
     template <typename FormatContext>
     auto format(const prepare_msg& m, FormatContext& ctx) const {
         return std::format_to(ctx.out(),
-            "PREPARE(round={}, accepted_round={}, accepted_values={})",
-            m.round, m.accepted_round, m.accepted_values.size());
+            "PREPARE(round={}, accepted_round={}, applied_up_to={}, accepted_values={})",
+            m.round, m.accepted_round, m.applied_up_to, m.accepted_values.size());
     }
 };
 
