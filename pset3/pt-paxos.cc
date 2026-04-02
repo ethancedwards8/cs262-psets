@@ -551,7 +551,7 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         if (problem) {
             std::print(std::clog,
                        "*** REPLICA DIVERGENCE on seed {} between replica {} and {} at key {}\n",
-                       seed, tester.initial_leader, s, *problem);
+                       seed, reference, s, *problem);
             db.print_near(*problem, std::clog);
             inst.replicas[s]->db_.print_near(*problem, std::clog);
             return false;
