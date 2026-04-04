@@ -17,6 +17,7 @@ enum failure_mode {
     multiple_random_up_down,
     split_brain,
     delayed_leader_failure,
+    cascading_star_partition,
     none,
 };
 
@@ -30,6 +31,7 @@ struct testinfo {
 
     int failed_replica = -1;
     failure_mode mode = failure_mode::none;
+    std::vector<size_t> excluded_replicas;
 
     template <typename T>
     void configure_port(netsim::port<T>& port) {
@@ -101,6 +103,8 @@ struct pt_paxos_instance {
 
     pt_paxos_instance(testinfo&, client_model&);
 };
+
+cot::task<> up_down_randomly(pt_paxos_instance& inst, int replica, cot::duration d);
 
 static size_t replica_index_from_source_id(const std::string& source_id) {
     return from_str_chars<size_t>(source_id.substr(1));
@@ -479,6 +483,38 @@ void set_partition_loss(pt_paxos_instance& inst,
     }
 }
 
+void set_replica_to_replica_loss(pt_paxos_instance& inst, double loss) {
+    for (size_t from = 0; from != inst.tester.nreplicas; ++from) {
+        for (size_t to = 0; to != inst.tester.nreplicas; ++to) {
+            if (from == to) {
+                continue;
+            }
+            inst.replicas[from]->to_replicas_[to]->set_loss(loss);
+        }
+    }
+}
+
+void apply_star_partition(pt_paxos_instance& inst, const std::vector<size_t>& hubs) {
+    std::vector<bool> is_hub(inst.tester.nreplicas, false);
+    for (size_t hub : hubs) {
+        if (hub < inst.tester.nreplicas) {
+            is_hub[hub] = true;
+        }
+    }
+
+    set_replica_to_replica_loss(inst, 1);
+    for (size_t from = 0; from != inst.tester.nreplicas; ++from) {
+        for (size_t to = 0; to != inst.tester.nreplicas; ++to) {
+            if (from == to) {
+                continue;
+            }
+            if (is_hub[from] || is_hub[to]) {
+                inst.replicas[from]->to_replicas_[to]->set_loss(inst.tester.loss);
+            }
+        }
+    }
+}
+
 void apply_split_brain(pt_paxos_instance& inst) {
     std::vector<size_t> minority{inst.tester.initial_leader};
     std::vector<size_t> majority;
@@ -494,6 +530,52 @@ void apply_split_brain(pt_paxos_instance& inst) {
 cot::task<> fail_primary_after(pt_paxos_instance& inst, cot::duration d) {
     co_await cot::after(d);
     set_replica_channel_loss(inst, inst.tester.initial_leader, 1);
+}
+
+cot::task<> cascading_star_partition_scenario(pt_paxos_instance& inst) {
+    if (inst.tester.nreplicas < 3) {
+        co_return;
+    }
+
+    std::vector<size_t> hubs{inst.tester.initial_leader};
+    apply_star_partition(inst, hubs);
+
+    std::vector<size_t> candidates;
+    candidates.reserve(inst.tester.nreplicas - 1);
+    for (size_t i = 0; i != inst.tester.nreplicas; ++i) {
+        if (i != inst.tester.initial_leader) {
+            candidates.push_back(i);
+        }
+    }
+    if (candidates.size() < 2) {
+        co_return;
+    }
+
+    std::shuffle(candidates.begin(), candidates.end(), inst.tester.randomness.engine());
+    size_t first_successor = candidates[0];
+    size_t second_successor = candidates[1];
+    inst.tester.excluded_replicas = {
+        inst.tester.initial_leader,
+        first_successor,
+        second_successor
+    };
+
+    co_await cot::after(30s);
+    set_replica_channel_loss(inst, inst.tester.initial_leader, 1);
+
+    co_await cot::after(5s);
+    hubs.push_back(first_successor);
+    apply_star_partition(inst, hubs);
+    cot::task<> first_flap = up_down_randomly(inst, static_cast<int>(first_successor), 3s);
+
+    co_await cot::after(10s);
+    hubs.push_back(second_successor);
+    apply_star_partition(inst, hubs);
+
+    co_await cot::after(10s);
+    cot::task<> second_flap = up_down_randomly(inst, static_cast<int>(second_successor), 3s);
+
+    co_await cot::after(1h);
 }
 
 cot::task<> up_down_randomly(pt_paxos_instance& inst, int replica, cot::duration d) {
@@ -516,6 +598,7 @@ cot::task<> clear_after(cot::duration d) {
 bool try_one_seed(testinfo& tester, unsigned long seed) {
     cot::reset();   // clear old events and coroutines
     tester.randomness.seed(seed);
+    tester.excluded_replicas.clear();
 
     // Create client generator and test instance
     lockseq_model clients(tester.nreplicas, tester.randomness);
@@ -542,6 +625,9 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         case failure_mode::split_brain:
             apply_split_brain(inst);
             break;
+        case failure_mode::cascading_star_partition:
+            tasks.push_back(cascading_star_partition_scenario(inst));
+            break;
         case failure_mode::none:
             break;
         case failure_mode::delayed_leader_failure:
@@ -560,6 +646,16 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
     if (tester.mode == failure_mode::failed_leader
         || tester.mode == failure_mode::split_brain)
         reference = (tester.initial_leader + 1) % tester.nreplicas;
+    if (tester.mode == failure_mode::cascading_star_partition) {
+        for (size_t s = 0; s != tester.nreplicas; ++s) {
+            if (std::find(tester.excluded_replicas.begin(),
+                          tester.excluded_replicas.end(),
+                          s) == tester.excluded_replicas.end()) {
+                reference = s;
+                break;
+            }
+        }
+    }
     pancy::pancydb& db = inst.replicas[reference]->db_;
 
     for (size_t s = 0; s != tester.nreplicas; ++s) {
@@ -574,7 +670,15 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
             continue;
         if (tester.mode == failure_mode::split_brain && s == tester.initial_leader)
             continue;
-        auto problem = db.diff(inst.replicas[s]->db_, 5);
+        if (tester.mode == failure_mode::cascading_star_partition
+            && std::find(tester.excluded_replicas.begin(),
+                         tester.excluded_replicas.end(),
+                         s) != tester.excluded_replicas.end())
+            continue;
+        auto problem = db.diff(
+            inst.replicas[s]->db_,
+            tester.mode == failure_mode::cascading_star_partition ? 10 : 5
+        );
         if (problem) {
             std::print(std::clog,
                        "*** REPLICA DIVERGENCE on seed {} between replica {} and {} at key {}\n",
@@ -583,6 +687,8 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
             inst.replicas[s]->db_.print_near(*problem, std::clog);
             return false;
         }
+
+        
     }
 
     if (auto problem = clients.check(db)) {
@@ -651,6 +757,8 @@ int main(int argc, char* argv[]) {
                 tester.mode = failure_mode::multiple_random_up_down;
             } else if (strcmp(optarg, "split_brain") == 0) {
                 tester.mode = failure_mode::split_brain;
+            } else if (strcmp(optarg, "cascading_star_partition") == 0) {
+                tester.mode = failure_mode::cascading_star_partition;
             } else if (strcmp(optarg, "delayed_leader_failure") == 0) {
                 tester.mode = failure_mode::delayed_leader_failure;
             }

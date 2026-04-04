@@ -316,4 +316,19 @@ https://read.seas.harvard.edu/cs2620/2026/lectures/multi-paxos/
 I followed it pretty closely but mapped an interesting raft optimization onto the probe/prep/prop/ack
 message types defined by eddie's notes.
 
+To really stress test and hammer my impl, I wanted to try this failure mode:
+
+There are 5 replicas where the leader can talk to all of the followers but none of the followers can talk to each other (partitioned)
+
+Then, the first leader fails after 30s. and over time one random replica is able to communicate with all of the other replicas (but the others still can't intermingle)
+
+but have the new leader that can communicate randomly fail and come back up (using the pre-existin function)
+
+and while that's happening, start giving another random replica the ability to talk to all replicas
+
+but then after 10s of it being leader make it also start doing the random up and down
+
+
 ## phase 4
+
+To 
