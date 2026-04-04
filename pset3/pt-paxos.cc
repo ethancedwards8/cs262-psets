@@ -80,6 +80,7 @@ struct pt_paxos_replica {
     unsigned long long applied_index_ = 0;
     std::vector<unsigned long long> match_index_;
     std::vector<unsigned long long> applied_up_to_;
+    size_t catchup_index_ = 0;
     cot::duration heartbeat_interval_ = 200ms;
     cot::duration failure_timeout_;
 
@@ -240,6 +241,7 @@ cot::task<> pt_paxos_replica::run_as_leader() {
         accepted_round_ = highest_accepted_round;
         accepted_values_ = highest_accepted_values;
     }
+    catchup_index_ = index_;
     match_index_[index_] = accepted_values_.size();
     applied_up_to_[index_] = applied_index_;
 
@@ -269,11 +271,33 @@ cot::task<> pt_paxos_replica::run_as_leader() {
 
         std::vector<bool> acked(nreplicas_, false);
         std::vector<propose_msg> in_flight(nreplicas_, propose);
-        for (size_t s = 0; s != nreplicas_; ++s) {
-            if (s == index_) {
-                continue;
+        auto rebuild_suffix = [&](size_t s, unsigned long long batch_start) {
+            auto& msg = in_flight[s];
+            msg.round = propose.round;
+            msg.batch_start = std::min<unsigned long long>(batch_start, accepted_values_.size());
+            msg.committed_slot = commit_index_;
+            msg.entries.clear();
+            for (size_t i = msg.batch_start; i != accepted_values_.size(); ++i) {
+                msg.entries.push_back(accepted_values_[i]);
             }
+        };
+        for (size_t s = 0; s != nreplicas_; ++s) {
+            if (s == index_)
+                continue;
             co_await to_replicas_[s]->send(in_flight[s]);
+        }
+
+        std::optional<size_t> repair_target;
+        for (size_t scanned = 0; scanned != nreplicas_; ++scanned) {
+            catchup_index_ = (catchup_index_ + 1) % nreplicas_;
+            if (catchup_index_ == index_)
+                continue;
+            if (match_index_[catchup_index_] < accepted_values_.size()) {
+                repair_target = catchup_index_;
+                rebuild_suffix(*repair_target, match_index_[*repair_target]);
+                co_await to_replicas_[*repair_target]->send(in_flight[*repair_target]);
+                break;
+            }
         }
 
         size_t ack_count = 0;
@@ -285,11 +309,12 @@ cot::task<> pt_paxos_replica::run_as_leader() {
 
             if (!ack_received) {
                 for (size_t s = 0; s != nreplicas_; ++s) {
-                    if (s == index_ || acked[s]) {
+                    if (s == index_ || acked[s])
                         continue;
-                    }
                     co_await to_replicas_[s]->send(in_flight[s]);
                 }
+                if (repair_target && !acked[*repair_target])
+                    co_await to_replicas_[*repair_target]->send(in_flight[*repair_target]);
                 continue;
             }
 
@@ -317,15 +342,9 @@ cot::task<> pt_paxos_replica::run_as_leader() {
                 match_index_[sender_index] = ack->highest_accepted;
                 applied_up_to_[sender_index] = ack->applied_up_to;
 
-                auto& repair = in_flight[sender_index];
-                repair.round = propose.round;
-                repair.batch_start = ack->highest_accepted;
-                repair.committed_slot = commit_index_;
-                repair.entries.clear();
-                for (size_t i = repair.batch_start; i != accepted_values_.size(); ++i) {
-                    repair.entries.push_back(accepted_values_[i]);
-                }
-                co_await to_replicas_[sender_index]->send(repair);
+                rebuild_suffix(sender_index, ack->highest_accepted);
+                repair_target = sender_index;
+                co_await to_replicas_[sender_index]->send(in_flight[sender_index]);
                 continue;
             }
 
@@ -677,7 +696,7 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
             continue;
         auto problem = db.diff(
             inst.replicas[s]->db_,
-            tester.mode == failure_mode::cascading_star_partition ? 10 : 5
+            tester.mode == failure_mode::cascading_star_partition ? 15 : 5
         );
         if (problem) {
             std::print(std::clog,

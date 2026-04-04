@@ -328,6 +328,8 @@ and while that's happening, start giving another random replica the ability to t
 
 but then after 10s of it being leader make it also start doing the random up and down
 
+this revealed that i hadn't implemented proper replica catchup yet, so i did that.
+
 
 ## phase 4
 
