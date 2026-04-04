@@ -263,9 +263,15 @@ cot::task<> pt_paxos_replica::run_as_leader() {
             match_index_[index_] = accepted_values_.size();
         }
 
-        co_await send_to_other_replicas(propose);
-
         std::vector<bool> acked(nreplicas_, false);
+        std::vector<propose_msg> in_flight(nreplicas_, propose);
+        for (size_t s = 0; s != nreplicas_; ++s) {
+            if (s == index_) {
+                continue;
+            }
+            co_await to_replicas_[s]->send(in_flight[s]);
+        }
+
         size_t ack_count = 0;
         while (ack_count < follower_quorum) {
             auto ack_received = co_await cot::attempt(
@@ -274,7 +280,12 @@ cot::task<> pt_paxos_replica::run_as_leader() {
             );
 
             if (!ack_received) {
-                co_await send_to_other_replicas(propose);
+                for (size_t s = 0; s != nreplicas_; ++s) {
+                    if (s == index_ || acked[s]) {
+                        continue;
+                    }
+                    co_await to_replicas_[s]->send(in_flight[s]);
+                }
                 continue;
             }
 
@@ -291,12 +302,28 @@ cot::task<> pt_paxos_replica::run_as_leader() {
             if (!ack)
                 continue;
 
-            if (ack->round != propose.round || !ack->success)
+            if (ack->round != propose.round)
                 continue;
 
             size_t sender_index = replica_index_from_source_id(source_id);
             if (acked[sender_index])
                 continue;
+
+            if (!ack->success) {
+                match_index_[sender_index] = ack->highest_accepted;
+                applied_up_to_[sender_index] = ack->applied_up_to;
+
+                auto& repair = in_flight[sender_index];
+                repair.round = propose.round;
+                repair.batch_start = ack->highest_accepted;
+                repair.committed_slot = commit_index_;
+                repair.entries.clear();
+                for (size_t i = repair.batch_start; i != accepted_values_.size(); ++i) {
+                    repair.entries.push_back(accepted_values_[i]);
+                }
+                co_await to_replicas_[sender_index]->send(repair);
+                continue;
+            }
 
             acked[sender_index] = true;
             match_index_[sender_index] = ack->highest_accepted;
