@@ -331,6 +331,12 @@ but then after 10s of it being leader make it also start doing the random up and
 this revealed that i hadn't implemented proper replica catchup yet, so i did that.
 
 
+another failure model:
+The leader is unstable (randomly up and down) where half of the other replicas are also randomly up and down and the other half of the replicas are partitioned off from the others.
+
+
+
+
 ## phase 4
 
 To 

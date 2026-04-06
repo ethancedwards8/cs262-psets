@@ -15,6 +15,7 @@ enum failure_mode {
     failed_leader,
     failed_replica,
     multiple_random_up_down,
+    unstable_leader_mixed,
     split_brain,
     delayed_leader_failure,
     cascading_star_partition,
@@ -106,6 +107,9 @@ struct pt_paxos_instance {
 };
 
 cot::task<> up_down_randomly(pt_paxos_instance& inst, int replica, cot::duration d);
+cot::task<> partition_groups_forever(pt_paxos_instance& inst,
+                                     std::vector<size_t> left,
+                                     std::vector<size_t> right);
 
 static size_t replica_index_from_source_id(const std::string& source_id) {
     return from_str_chars<size_t>(source_id.substr(1));
@@ -609,6 +613,13 @@ cot::task<> up_down_randomly(pt_paxos_instance& inst, int replica, cot::duration
     }
 }
 
+cot::task<> partition_groups_forever(pt_paxos_instance& inst,
+                                     std::vector<size_t> left,
+                                     std::vector<size_t> right) {
+    set_partition_loss(inst, left, right, 1);
+    co_await cot::after(1h);
+}
+
 cot::task<> clear_after(cot::duration d) {
     co_await cot::after(d);
     cot::clear();
@@ -641,6 +652,43 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         case failure_mode::multiple_random_up_down:
             tasks.push_back(up_down_randomly(inst, tester.failed_replica, 3s));
             break;
+        case failure_mode::unstable_leader_mixed: {
+            std::vector<size_t> followers;
+            followers.reserve(tester.nreplicas - 1);
+            for (size_t s = 0; s != tester.nreplicas; ++s) {
+                if (s != tester.initial_leader) {
+                    followers.push_back(s);
+                }
+            }
+
+            std::shuffle(followers.begin(), followers.end(), tester.randomness.engine());
+
+            size_t flapping_count = followers.size() / 2;
+            std::vector<size_t> flapping_followers(
+                followers.begin(), followers.begin() + flapping_count
+            );
+            std::vector<size_t> partitioned_followers(
+                followers.begin() + flapping_count, followers.end()
+            );
+
+            tester.excluded_replicas = partitioned_followers;
+
+            std::vector<size_t> connected_group{tester.initial_leader};
+            connected_group.insert(connected_group.end(),
+                                   flapping_followers.begin(),
+                                   flapping_followers.end());
+
+            tasks.push_back(partition_groups_forever(
+                inst, connected_group, partitioned_followers
+            ));
+            tasks.push_back(up_down_randomly(
+                inst, static_cast<int>(tester.initial_leader), 3s
+            ));
+            for (size_t s : flapping_followers) {
+                tasks.push_back(up_down_randomly(inst, static_cast<int>(s), 3s));
+            }
+            break;
+        }
         case failure_mode::split_brain:
             apply_split_brain(inst);
             break;
@@ -665,7 +713,8 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
     if (tester.mode == failure_mode::failed_leader
         || tester.mode == failure_mode::split_brain)
         reference = (tester.initial_leader + 1) % tester.nreplicas;
-    if (tester.mode == failure_mode::cascading_star_partition) {
+    if (tester.mode == failure_mode::cascading_star_partition
+        || tester.mode == failure_mode::unstable_leader_mixed) {
         for (size_t s = 0; s != tester.nreplicas; ++s) {
             if (std::find(tester.excluded_replicas.begin(),
                           tester.excluded_replicas.end(),
@@ -690,6 +739,11 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         if (tester.mode == failure_mode::split_brain && s == tester.initial_leader)
             continue;
         if (tester.mode == failure_mode::cascading_star_partition
+            && std::find(tester.excluded_replicas.begin(),
+                         tester.excluded_replicas.end(),
+                         s) != tester.excluded_replicas.end())
+            continue;
+        if (tester.mode == failure_mode::unstable_leader_mixed
             && std::find(tester.excluded_replicas.begin(),
                          tester.excluded_replicas.end(),
                          s) != tester.excluded_replicas.end())
@@ -774,6 +828,8 @@ int main(int argc, char* argv[]) {
                     return -1;
                 }
                 tester.mode = failure_mode::multiple_random_up_down;
+            } else if (strcmp(optarg, "unstable_leader_mixed") == 0) {
+                tester.mode = failure_mode::unstable_leader_mixed;
             } else if (strcmp(optarg, "split_brain") == 0) {
                 tester.mode = failure_mode::split_brain;
             } else if (strcmp(optarg, "cascading_star_partition") == 0) {
