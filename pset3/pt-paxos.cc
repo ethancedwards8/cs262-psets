@@ -16,6 +16,7 @@ enum failure_mode {
     failed_replica,
     multiple_random_up_down,
     unstable_leader_mixed,
+    random_failure_schedule,
     split_brain,
     delayed_leader_failure,
     cascading_star_partition,
@@ -540,6 +541,42 @@ inline cot::task<> heal_all_directed_edges_one_by_one(pt_paxos_instance& inst,
     }
 }
 
+cot::task<> recover_replica_after(pt_paxos_instance& inst,
+                                  testinfo& tester,
+                                  size_t replica,
+                                  cot::duration delay,
+                                  std::shared_ptr<std::vector<bool>> active_failures,
+                                  std::shared_ptr<size_t> currently_failed) {
+    co_await cot::after(delay);
+    if (replica >= tester.nreplicas || !(*active_failures)[replica])
+        co_return;
+    set_replica_channel_loss(inst, replica, tester.loss);
+    (*active_failures)[replica] = false;
+    if (*currently_failed > 0)
+        --*currently_failed;
+}
+
+cot::task<> partition_replicas_after(pt_paxos_instance& inst,
+                                     testinfo& tester,
+                                     size_t a,
+                                     size_t b,
+                                     cot::duration delay,
+                                     cot::duration heal_after = 0ms,
+                                     bool two_way = true) {
+    co_await cot::after(delay);
+    set_replica_link_loss(inst, a, b, 1.0);
+    if (two_way)
+        set_replica_link_loss(inst, b, a, 1.0);
+
+    if (heal_after <= 0ms)
+        co_return;
+
+    co_await cot::after(heal_after);
+    set_replica_link_loss(inst, a, b, tester.loss);
+    if (two_way)
+        set_replica_link_loss(inst, b, a, tester.loss);
+}
+
 void set_replica_to_replica_loss(pt_paxos_instance& inst, double loss) {
     for (size_t from = 0; from != inst.tester.nreplicas; ++from) {
         for (size_t to = 0; to != inst.tester.nreplicas; ++to) {
@@ -686,6 +723,64 @@ cot::task<> split_brain_isolate_heal_schedule(pt_paxos_instance& inst,
     co_await heal_all_directed_edges_one_by_one(inst, tester, step_pause);
 }
 
+cot::task<> random_failure_schedule_task(pt_paxos_instance& inst) {
+    size_t n = inst.tester.nreplicas;
+    size_t max_failed = (n - 1) / 2;
+    auto active_failures = std::make_shared<std::vector<bool>>(n, false);
+    auto currently_failed = std::make_shared<size_t>(0);
+    std::vector<cot::task<>> scheduled_events;
+    random_source& rng = inst.tester.randomness;
+
+    while (true) {
+        co_await cot::after(rng.uniform(200ms, 800ms));
+
+        double roll = rng.uniform(0.0, 1.0);
+        if (roll < 0.4 && *currently_failed < max_failed) {
+            std::vector<size_t> candidates;
+            candidates.reserve(n);
+            for (size_t i = 0; i != n; ++i) {
+                if (!(*active_failures)[i])
+                    candidates.push_back(i);
+            }
+            if (candidates.empty())
+                continue;
+
+            size_t victim = candidates[rng.uniform<size_t>(0, candidates.size() - 1)];
+            bool recovers = rng.coin_flip();
+            cot::duration crash_dur = recovers ? rng.uniform(100ms, 500ms) : 0ms;
+
+            (*active_failures)[victim] = true;
+            ++*currently_failed;
+            set_replica_channel_loss(inst, victim, 1.0);
+
+            if (crash_dur > 0ms) {
+                scheduled_events.push_back(recover_replica_after(
+                    inst, inst.tester, victim, crash_dur, active_failures, currently_failed
+                ));
+            } else if (std::find(inst.tester.excluded_replicas.begin(),
+                                 inst.tester.excluded_replicas.end(),
+                                 victim) == inst.tester.excluded_replicas.end()) {
+                inst.tester.excluded_replicas.push_back(victim);
+            }
+        } else if (roll < 0.7) {
+            if (n < 2)
+                continue;
+            size_t a = rng.uniform<size_t>(0, n - 1);
+            size_t b = a;
+            while (b == a)
+                b = rng.uniform<size_t>(0, n - 1);
+
+            bool two_way = rng.coin_flip();
+            bool heals = rng.coin_flip();
+            cot::duration heal_after = heals ? rng.uniform(100ms, 400ms) : 0ms;
+
+            scheduled_events.push_back(partition_replicas_after(
+                inst, inst.tester, a, b, 0ms, heal_after, two_way
+            ));
+        }
+    }
+}
+
 cot::task<> clear_after(cot::duration d) {
     co_await cot::after(d);
     cot::clear();
@@ -755,6 +850,9 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
             }
             break;
         }
+        case failure_mode::random_failure_schedule:
+            tasks.push_back(random_failure_schedule_task(inst));
+            break;
         case failure_mode::split_brain:
             apply_split_brain(inst);
             break;
@@ -783,7 +881,8 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         || tester.mode == failure_mode::split_brain)
         reference = (tester.initial_leader + 1) % tester.nreplicas;
     if (tester.mode == failure_mode::cascading_star_partition
-        || tester.mode == failure_mode::unstable_leader_mixed) {
+        || tester.mode == failure_mode::unstable_leader_mixed
+        || tester.mode == failure_mode::random_failure_schedule) {
         for (size_t s = 0; s != tester.nreplicas; ++s) {
             if (std::find(tester.excluded_replicas.begin(),
                           tester.excluded_replicas.end(),
@@ -813,6 +912,11 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
                          s) != tester.excluded_replicas.end())
             continue;
         if (tester.mode == failure_mode::unstable_leader_mixed
+            && std::find(tester.excluded_replicas.begin(),
+                         tester.excluded_replicas.end(),
+                         s) != tester.excluded_replicas.end())
+            continue;
+        if (tester.mode == failure_mode::random_failure_schedule
             && std::find(tester.excluded_replicas.begin(),
                          tester.excluded_replicas.end(),
                          s) != tester.excluded_replicas.end())
@@ -899,6 +1003,8 @@ int main(int argc, char* argv[]) {
                 tester.mode = failure_mode::multiple_random_up_down;
             } else if (strcmp(optarg, "unstable_leader_mixed") == 0) {
                 tester.mode = failure_mode::unstable_leader_mixed;
+            } else if (strcmp(optarg, "random_failure_schedule") == 0) {
+                tester.mode = failure_mode::random_failure_schedule;
             } else if (strcmp(optarg, "split_brain") == 0) {
                 tester.mode = failure_mode::split_brain;
             } else if (strcmp(optarg, "cascading_star_partition") == 0) {
