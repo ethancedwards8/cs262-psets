@@ -19,6 +19,7 @@ enum failure_mode {
     split_brain,
     delayed_leader_failure,
     cascading_star_partition,
+    split_brain_isolate_heal,
     none,
 };
 
@@ -506,6 +507,39 @@ void set_partition_loss(pt_paxos_instance& inst,
     }
 }
 
+inline void set_replica_link_loss(pt_paxos_instance& inst, size_t i, size_t j, double loss) {
+    if (i == j)
+        return;
+    inst.replicas[i]->to_replicas_[j]->set_loss(loss);
+}
+
+inline void set_within_side_links(pt_paxos_instance& inst, size_t left_size, double loss) {
+    const size_t n = inst.replicas.size();
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j)
+                continue;
+            const bool same_side = (i < left_size) == (j < left_size);
+            if (same_side)
+                set_replica_link_loss(inst, i, j, loss);
+        }
+    }
+}
+
+inline cot::task<> heal_all_directed_edges_one_by_one(pt_paxos_instance& inst,
+                                                      testinfo& tester,
+                                                      cot::duration step_pause) {
+    const size_t n = inst.replicas.size();
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j)
+                continue;
+            set_replica_link_loss(inst, i, j, tester.loss);
+            co_await cot::after(step_pause);
+        }
+    }
+}
+
 void set_replica_to_replica_loss(pt_paxos_instance& inst, double loss) {
     for (size_t from = 0; from != inst.tester.nreplicas; ++from) {
         for (size_t to = 0; to != inst.tester.nreplicas; ++to) {
@@ -620,6 +654,38 @@ cot::task<> partition_groups_forever(pt_paxos_instance& inst,
     co_await cot::after(1h);
 }
 
+cot::task<> split_brain_isolate_heal_schedule(pt_paxos_instance& inst,
+                                              testinfo& tester,
+                                              cot::duration t_split = 10s,
+                                              cot::duration t_isolate_within = 10s,
+                                              cot::duration step_pause = 1s,
+                                              size_t left_size = 0) {
+    const size_t n = tester.nreplicas;
+    if (left_size == 0)
+        left_size = n / 2;
+    if (n <= 1 || left_size == 0 || left_size >= n)
+        co_return;
+
+    std::vector<size_t> left;
+    std::vector<size_t> right;
+    left.reserve(left_size);
+    right.reserve(n - left_size);
+    for (size_t i = 0; i < n; ++i) {
+        if (i < left_size)
+            left.push_back(i);
+        else
+            right.push_back(i);
+    }
+
+    co_await cot::after(t_split);
+    set_partition_loss(inst, left, right, 1.0);
+
+    co_await cot::after(t_isolate_within);
+    set_within_side_links(inst, left_size, 1.0);
+
+    co_await heal_all_directed_edges_one_by_one(inst, tester, step_pause);
+}
+
 cot::task<> clear_after(cot::duration d) {
     co_await cot::after(d);
     cot::clear();
@@ -694,6 +760,9 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
             break;
         case failure_mode::cascading_star_partition:
             tasks.push_back(cascading_star_partition_scenario(inst));
+            break;
+        case failure_mode::split_brain_isolate_heal:
+            tasks.push_back(split_brain_isolate_heal_schedule(inst, tester));
             break;
         case failure_mode::none:
             break;
@@ -834,6 +903,8 @@ int main(int argc, char* argv[]) {
                 tester.mode = failure_mode::split_brain;
             } else if (strcmp(optarg, "cascading_star_partition") == 0) {
                 tester.mode = failure_mode::cascading_star_partition;
+            } else if (strcmp(optarg, "split_brain_isolate_heal") == 0) {
+                tester.mode = failure_mode::split_brain_isolate_heal;
             } else if (strcmp(optarg, "delayed_leader_failure") == 0) {
                 tester.mode = failure_mode::delayed_leader_failure;
             }
