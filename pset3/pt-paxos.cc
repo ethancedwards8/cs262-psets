@@ -17,6 +17,7 @@ enum failure_mode {
     multiple_random_up_down,
     unstable_leader_mixed,
     random_failure_schedule,
+    disruptive_isolate,
     split_brain,
     delayed_leader_failure,
     cascading_star_partition,
@@ -781,6 +782,37 @@ cot::task<> random_failure_schedule_task(pt_paxos_instance& inst) {
     }
 }
 
+cot::task<> disruptive_isolate_routine(pt_paxos_instance& inst,
+                                       cot::duration split_time = 10s,
+                                       cot::duration heal_time = 10s) {
+    co_await cot::after(split_time);
+
+    size_t victim = inst.tester.nreplicas;
+    std::vector<size_t> followers;
+    followers.reserve(inst.tester.nreplicas);
+    for (size_t s = 0; s < inst.tester.nreplicas; ++s) {
+        if (inst.replicas[s]->leader_index_ != s)
+            followers.push_back(s);
+    }
+
+    if (!followers.empty()) {
+        victim = followers[inst.tester.randomness.uniform<size_t>(0, followers.size() - 1)];
+        for (size_t s = 0; s < inst.tester.nreplicas; ++s) {
+            if (s != victim)
+                inst.replicas[s]->to_replicas_[victim]->set_loss(1.0);
+        }
+    }
+
+    co_await cot::after(heal_time);
+
+    if (victim != inst.tester.nreplicas) {
+        for (size_t s = 0; s < inst.tester.nreplicas; ++s) {
+            if (s != victim)
+                inst.replicas[s]->to_replicas_[victim]->set_loss(inst.tester.loss);
+        }
+    }
+}
+
 cot::task<> clear_after(cot::duration d) {
     co_await cot::after(d);
     cot::clear();
@@ -852,6 +884,9 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         }
         case failure_mode::random_failure_schedule:
             tasks.push_back(random_failure_schedule_task(inst));
+            break;
+        case failure_mode::disruptive_isolate:
+            tasks.push_back(disruptive_isolate_routine(inst));
             break;
         case failure_mode::split_brain:
             apply_split_brain(inst);
@@ -1005,6 +1040,8 @@ int main(int argc, char* argv[]) {
                 tester.mode = failure_mode::unstable_leader_mixed;
             } else if (strcmp(optarg, "random_failure_schedule") == 0) {
                 tester.mode = failure_mode::random_failure_schedule;
+            } else if (strcmp(optarg, "disruptive_isolate") == 0) {
+                tester.mode = failure_mode::disruptive_isolate;
             } else if (strcmp(optarg, "split_brain") == 0) {
                 tester.mode = failure_mode::split_brain;
             } else if (strcmp(optarg, "cascading_star_partition") == 0) {
