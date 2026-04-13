@@ -17,6 +17,7 @@ enum failure_mode {
     multiple_random_up_down,
     unstable_leader_mixed,
     split_brain,
+    minority_partition_failure,
     delayed_leader_failure,
     cascading_star_partition,
     none,
@@ -506,6 +507,16 @@ void set_partition_loss(pt_paxos_instance& inst,
     }
 }
 
+void fail(pt_paxos_instance& inst, size_t a, size_t b) {
+    inst.replicas[a]->to_replicas_[b]->set_loss(1.0);
+    inst.replicas[b]->to_replicas_[a]->set_loss(1.0);
+}
+
+void recover(pt_paxos_instance& inst, size_t a, size_t b, double loss) {
+    inst.replicas[a]->to_replicas_[b]->set_loss(loss);
+    inst.replicas[b]->to_replicas_[a]->set_loss(loss);
+}
+
 void set_replica_to_replica_loss(pt_paxos_instance& inst, double loss) {
     for (size_t from = 0; from != inst.tester.nreplicas; ++from) {
         for (size_t to = 0; to != inst.tester.nreplicas; ++to) {
@@ -548,6 +559,46 @@ void apply_split_brain(pt_paxos_instance& inst) {
         }
     }
     set_partition_loss(inst, minority, majority, 1);
+}
+
+cot::task<> minority_partition(pt_paxos_instance& inst, size_t leader_id, cot::duration duration) {
+    co_await cot::after(10s);
+
+    size_t num_replicas = inst.replicas.size();
+    size_t majority = num_replicas / 2 + 1;
+
+    std::vector<size_t> majority_set;
+    std::vector<size_t> minority_set{leader_id};
+
+    for (size_t i = 0; i < num_replicas; ++i) {
+        if (i == leader_id) {
+            continue;
+        }
+        if (majority_set.size() < majority) {
+            majority_set.push_back(i);
+        } else {
+            minority_set.push_back(i);
+        }
+    }
+
+    for (size_t a : majority_set) {
+        for (size_t b : minority_set) {
+            fail(inst, a, b);
+            inst.replicas[b]->to_clients_.set_loss(1.0);
+            inst.clients.request_channel(b).set_loss(1.0);
+        }
+    }
+
+    co_await cot::after(duration);
+
+    double loss = inst.tester.loss;
+    for (size_t a : majority_set) {
+        for (size_t b : minority_set) {
+            recover(inst, a, b, loss);
+            inst.replicas[b]->to_clients_.set_loss(loss);
+            inst.clients.request_channel(b).set_loss(loss);
+        }
+    }
 }
 
 cot::task<> fail_primary_after(pt_paxos_instance& inst, cot::duration d) {
@@ -692,6 +743,9 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
         case failure_mode::split_brain:
             apply_split_brain(inst);
             break;
+        case failure_mode::minority_partition_failure:
+            tasks.push_back(minority_partition(inst, tester.initial_leader, 20s));
+            break;
         case failure_mode::cascading_star_partition:
             tasks.push_back(cascading_star_partition_scenario(inst));
             break;
@@ -832,6 +886,8 @@ int main(int argc, char* argv[]) {
                 tester.mode = failure_mode::unstable_leader_mixed;
             } else if (strcmp(optarg, "split_brain") == 0) {
                 tester.mode = failure_mode::split_brain;
+            } else if (strcmp(optarg, "minority_partition") == 0) {
+                tester.mode = failure_mode::minority_partition_failure;
             } else if (strcmp(optarg, "cascading_star_partition") == 0) {
                 tester.mode = failure_mode::cascading_star_partition;
             } else if (strcmp(optarg, "delayed_leader_failure") == 0) {
