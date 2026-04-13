@@ -1,6 +1,8 @@
 #include "lockseq_model.hh"
 #include <algorithm>
+#include <cassert>
 #include <cstring>
+#include <optional>
 #include "pancydb.hh"
 #include "netsim.hh"
 #include "paxos.hh"
@@ -66,6 +68,11 @@ struct pt_paxos_instance;
 
 // The type for inter-replica messages. You will change this!
 // paxos_message is defined in paxos.hh
+enum class raft_role {
+    follower,
+    candidate,
+    leader,
+};
 
 struct pt_paxos_replica {
     size_t index_;           // index of this replica in the replica set
@@ -80,16 +87,18 @@ struct pt_paxos_replica {
 
 
     // ...plus anything you want to add
-    unsigned long long next_round_ = 1;
-    unsigned long long accepted_round_ = 0;
-    std::deque<pancy::request> accepted_values_;
+    random_source& randomness_;
+    raft_role role_ = raft_role::follower;
+    unsigned long long current_term_ = 0;
+    std::optional<size_t> voted_for_;
+    std::deque<log_entry> log_;
     unsigned long long commit_index_ = 0;
     unsigned long long applied_index_ = 0;
+    std::vector<unsigned long long> next_index_;
     std::vector<unsigned long long> match_index_;
-    std::vector<unsigned long long> applied_up_to_;
-    size_t catchup_index_ = 0;
-    cot::duration heartbeat_interval_ = 200ms;
-    cot::duration failure_timeout_;
+    std::deque<unsigned long long> pending_client_slots_;
+    cot::duration heartbeat_interval_ = 50ms;
+    cot::duration election_timeout_;
 
     pt_paxos_replica(size_t index, size_t nreplicas, random_source&);
     void initialize(pt_paxos_instance&);
@@ -97,10 +106,25 @@ struct pt_paxos_replica {
     cot::task<> run();
     cot::task<> run_as_leader();
     cot::task<> run_as_follower();
+    cot::task<> run_as_candidate();
     cot::task<> send_to_other_replicas(const paxos_message& msg);
 
 private: 
     unsigned long quorum_ = nreplicas_ / 2 + 1;
+    void reset_election_timeout();
+    void become_follower(unsigned long long term, std::optional<size_t> leader = std::nullopt);
+    void become_leader();
+    unsigned long long last_log_index() const;
+    unsigned long long last_log_term() const;
+    unsigned long long log_term(unsigned long long index) const;
+    bool candidate_log_is_up_to_date(const request_vote_request& vote) const;
+    append_entries_request make_append_entries(size_t follower) const;
+    cot::task<> apply_committed_entries();
+    cot::task<bool> handle_append_entries(const append_entries_request& append);
+    cot::task<bool> handle_request_vote(const request_vote_request& vote, size_t sender_index);
+    cot::task<> send_append_entries(size_t follower);
+    void advance_commit_index();
+    void check_paxos_invariants() const;
 };
 
 struct pt_paxos_instance {
@@ -121,10 +145,19 @@ static size_t replica_index_from_source_id(const std::string& source_id) {
     return from_str_chars<size_t>(source_id.substr(1));
 }
 
-static unsigned long long message_round(const paxos_message& msg) {
+static unsigned long long message_term(const paxos_message& msg) {
     return std::visit([](const auto& m) {
-        return m.round;
+        if constexpr (requires { m.term; }) {
+            return m.term;
+        } else {
+            return m.round;
+        }
     }, msg);
+}
+
+void pt_paxos_replica::check_paxos_invariants() const {
+    assert(log_.size() >= commit_index_);
+    assert(applied_index_ <= commit_index_);
 }
 
 
@@ -137,9 +170,10 @@ pt_paxos_replica::pt_paxos_replica(size_t index, size_t nreplicas, random_source
       from_replicas_(randomness, std::format("R{}/r", index_)),
       to_clients_(randomness, from_clients_.id()),
       to_replicas_(nreplicas),
+      randomness_(randomness),
+      next_index_(nreplicas, 1),
       match_index_(nreplicas, 0),
-      applied_up_to_(nreplicas, 0),
-      failure_timeout_(randomness.uniform(800ms, 1200ms)) {
+      election_timeout_(randomness.uniform(800ms, 1200ms)) {
     for (size_t s = 0UL; s != nreplicas_; ++s) {
         to_replicas_[s].reset(new netsim::channel<paxos_message>(
             randomness, from_clients_.id()
@@ -176,8 +210,10 @@ pt_paxos_instance::pt_paxos_instance(testinfo& tester, client_model& clients)
 
 cot::task<> pt_paxos_replica::run() {
     while (true) {
-        if (index_ == leader_index_) {
+        if (role_ == raft_role::leader) {
             co_await run_as_leader();
+        } else if (role_ == raft_role::candidate) {
+            co_await run_as_candidate();
         } else {
             co_await run_as_follower();
         }
@@ -193,225 +229,317 @@ cot::task<> pt_paxos_replica::send_to_other_replicas(const paxos_message& msg) {
     }
 }
 
-cot::task<> pt_paxos_replica::run_as_leader() {
-    probe_msg probe;
-    probe.round = next_round_++;
+void pt_paxos_replica::reset_election_timeout() {
+    election_timeout_ = randomness_.uniform(800ms, 1200ms);
+}
 
-    co_await send_to_other_replicas(probe);
+void pt_paxos_replica::become_follower(unsigned long long term,
+                                       std::optional<size_t> leader) {
+    if (term > current_term_) {
+        current_term_ = term;
+        voted_for_.reset();
+    }
+    role_ = raft_role::follower;
+    pending_client_slots_.clear();
+    if (leader) {
+        leader_index_ = *leader;
+    }
+    reset_election_timeout();
+}
 
+void pt_paxos_replica::become_leader() {
+    role_ = raft_role::leader;
+    leader_index_ = index_;
+    std::fill(next_index_.begin(), next_index_.end(), last_log_index() + 1);
     std::fill(match_index_.begin(), match_index_.end(), 0);
-    std::fill(applied_up_to_.begin(), applied_up_to_.end(), 0);
+    match_index_[index_] = last_log_index();
+    pending_client_slots_.clear();
+}
 
-    std::vector<bool> prepared(nreplicas_, false);
-    size_t prepare_count = 0;
-    unsigned long long highest_accepted_round = accepted_round_;
-    std::deque<pancy::request> highest_accepted_values = accepted_values_;
-    while (prepare_count < quorum_ - 1) {
-        auto received = co_await cot::attempt(
-            from_replicas_.receive_with_id(),
-            cot::after(200ms)
-        );
+unsigned long long pt_paxos_replica::last_log_index() const {
+    return log_.size();
+}
 
-        if (!received) {
-            co_await send_to_other_replicas(probe);
-            continue;
+unsigned long long pt_paxos_replica::last_log_term() const {
+    return log_.empty() ? 0 : log_.back().term;
+}
+
+unsigned long long pt_paxos_replica::log_term(unsigned long long index) const {
+    assert(index <= log_.size());
+    return index == 0 ? 0 : log_[index - 1].term;
+}
+
+bool pt_paxos_replica::candidate_log_is_up_to_date(const request_vote_request& vote) const {
+    auto our_last_term = last_log_term();
+    if (vote.last_log_term != our_last_term) {
+        return vote.last_log_term > our_last_term;
+    }
+    return vote.last_log_index >= last_log_index();
+}
+
+append_entries_request pt_paxos_replica::make_append_entries(size_t follower) const {
+    append_entries_request append;
+    append.term = current_term_;
+    append.leader_id = index_;
+    append.leader_commit = commit_index_;
+    auto next = std::clamp<unsigned long long>(
+        next_index_[follower], 1, last_log_index() + 1
+    );
+    append.prev_log_index = next - 1;
+    append.prev_log_term = log_term(append.prev_log_index);
+    for (auto i = next; i <= last_log_index(); ++i) {
+        append.entries.push_back(log_[i - 1]);
+    }
+    return append;
+}
+
+cot::task<> pt_paxos_replica::apply_committed_entries() {
+    while (applied_index_ < commit_index_) {
+        ++applied_index_;
+        auto response = db_.process_req(log_[applied_index_ - 1].command);
+        if (!pending_client_slots_.empty()
+            && pending_client_slots_.front() == applied_index_) {
+            co_await to_clients_.send(std::move(response));
+            pending_client_slots_.pop_front();
         }
+    }
+    check_paxos_invariants();
+}
 
-        auto& [paxos_msg, source_id] = *received;
-        if (message_round(paxos_msg) > probe.round) {
-            accepted_round_ = message_round(paxos_msg);
-            next_round_ = std::max(next_round_, accepted_round_ + 1);
-            leader_index_ = replica_index_from_source_id(source_id);
-            co_return;
-        }
+cot::task<bool> pt_paxos_replica::handle_request_vote(const request_vote_request& vote,
+                                                      size_t sender_index) {
+    request_vote_response response;
 
-        auto* prepare = std::get_if<prepare_msg>(&paxos_msg);
-        if (!prepare)
-            continue;
-
-        if (prepare->round != probe.round)
-            continue;
-
-        size_t sender_index = replica_index_from_source_id(source_id);
-        if (prepared[sender_index])
-            continue;
-
-        prepared[sender_index] = true;
-        applied_up_to_[sender_index] = prepare->applied_up_to;
-
-        if (prepare->accepted_round > highest_accepted_round) {
-            highest_accepted_round = prepare->accepted_round;
-            highest_accepted_values = prepare->accepted_values;
-        }
-        ++prepare_count;
+    if (vote.term < current_term_) {
+        response.term = current_term_;
+        response.vote_granted = false;
+        co_await to_replicas_[sender_index]->send(response);
+        co_return false;
     }
 
-    // Adopt highest accepted values but do NOT apply to db yet
-    if (highest_accepted_round > accepted_round_) {
-        accepted_round_ = highest_accepted_round;
-        accepted_values_ = highest_accepted_values;
+    if (vote.term > current_term_) {
+        become_follower(vote.term);
     }
-    catchup_index_ = index_;
-    match_index_[index_] = accepted_values_.size();
-    applied_up_to_[index_] = applied_index_;
 
-    std::deque<unsigned long long> pending_client_slots;
-    std::deque<pancy::response> ready_client_responses;
-    const size_t follower_quorum = quorum_ > 0 ? quorum_ - 1 : 0;
+    bool can_vote = !voted_for_ || *voted_for_ == vote.candidate_id;
+    bool grant = can_vote && candidate_log_is_up_to_date(vote);
+    if (grant) {
+        voted_for_ = vote.candidate_id;
+        role_ = raft_role::follower;
+        reset_election_timeout();
+    }
+
+    response.term = current_term_;
+    response.vote_granted = grant;
+    co_await to_replicas_[sender_index]->send(response);
+    co_return grant;
+}
+
+cot::task<bool> pt_paxos_replica::handle_append_entries(const append_entries_request& append) {
+    append_entries_response response;
+    response.term = current_term_;
+
+    if (append.term < current_term_) {
+        co_await to_replicas_[append.leader_id]->send(response);
+        co_return false;
+    }
+
+    if (append.term > current_term_ || role_ != raft_role::follower) {
+        become_follower(append.term, append.leader_id);
+    } else {
+        leader_index_ = append.leader_id;
+        reset_election_timeout();
+    }
+    response.term = current_term_;
+
+    if (append.prev_log_index > last_log_index()) {
+        response.conflict_index = last_log_index() + 1;
+        response.match_index = last_log_index();
+        co_await to_replicas_[append.leader_id]->send(response);
+        co_return true;
+    }
+
+    if (log_term(append.prev_log_index) != append.prev_log_term) {
+        response.conflict_term = log_term(append.prev_log_index);
+        response.conflict_index = append.prev_log_index;
+        while (response.conflict_index > 1
+               && log_term(response.conflict_index - 1) == response.conflict_term) {
+            --response.conflict_index;
+        }
+        response.match_index = response.conflict_index - 1;
+        co_await to_replicas_[append.leader_id]->send(response);
+        co_return true;
+    }
+
+    unsigned long long insert_index = append.prev_log_index + 1;
+    size_t entry_offset = 0;
+    while (entry_offset < append.entries.size()
+           && insert_index + entry_offset <= last_log_index()
+           && log_term(insert_index + entry_offset) == append.entries[entry_offset].term) {
+        ++entry_offset;
+    }
+
+    if (entry_offset < append.entries.size()) {
+        log_.resize(insert_index + entry_offset - 1);
+        while (entry_offset < append.entries.size()) {
+            log_.push_back(append.entries[entry_offset]);
+            ++entry_offset;
+        }
+    }
+
+    if (append.leader_commit > commit_index_) {
+        commit_index_ = std::min(append.leader_commit, last_log_index());
+        co_await apply_committed_entries();
+    }
+
+    response.success = true;
+    response.match_index = append.prev_log_index + append.entries.size();
+    co_await to_replicas_[append.leader_id]->send(response);
+    co_return true;
+}
+
+cot::task<> pt_paxos_replica::send_append_entries(size_t follower) {
+    if (follower == index_)
+        co_return;
+    co_await to_replicas_[follower]->send(make_append_entries(follower));
+}
+
+void pt_paxos_replica::advance_commit_index() {
+    match_index_[index_] = last_log_index();
+    for (auto n = last_log_index(); n > commit_index_; --n) {
+        if (log_term(n) != current_term_) {
+            continue;
+        }
+        size_t replicated = 1; // leader
+        for (size_t s = 0; s != nreplicas_; ++s) {
+            if (s != index_ && match_index_[s] >= n) {
+                ++replicated;
+            }
+        }
+        if (replicated >= quorum_) {
+            commit_index_ = n;
+            return;
+        }
+    }
+}
+
+cot::task<> pt_paxos_replica::run_as_leader() {
+    check_paxos_invariants();
+
+    for (size_t s = 0; s != nreplicas_; ++s) {
+        co_await send_append_entries(s);
+    }
 
     while (true) {
-        auto received = co_await cot::attempt(
+        auto event = co_await cot::first(
             from_clients_.receive(),
+            from_replicas_.receive_with_id(),
             cot::after(heartbeat_interval_)
         );
 
-        propose_msg propose;
-        propose.round = next_round_++;
-        propose.batch_start = accepted_values_.size();
-        propose.committed_slot = commit_index_;
+        auto* req = std::get_if<pancy::request>(&event);
+        if (req) {
+            log_.push_back(log_entry{current_term_, std::move(*req)});
+            match_index_[index_] = last_log_index();
+            pending_client_slots_.push_back(last_log_index());
+            check_paxos_invariants();
+            advance_commit_index();
+            co_await apply_committed_entries();
+            for (size_t s = 0; s != nreplicas_; ++s) {
+                co_await send_append_entries(s);
+            }
+            continue;
+        }
 
+        auto* received = std::get_if<std::pair<paxos_message, std::string>>(&event);
         if (received) {
-            auto req = std::move(*received);
-            pending_client_slots.push_back(propose.batch_start);
-            accepted_values_.push_back(req);
-            propose.entries.push_back(req);
-            accepted_round_ = propose.round;
-            match_index_[index_] = accepted_values_.size();
-        }
+            auto& [paxos_msg, source_id] = *received;
+            size_t sender_index = replica_index_from_source_id(source_id);
 
-        std::vector<bool> acked(nreplicas_, false);
-        std::vector<propose_msg> in_flight(nreplicas_, propose);
-        auto rebuild_suffix = [&](size_t s, unsigned long long batch_start) {
-            auto& msg = in_flight[s];
-            msg.round = propose.round;
-            msg.batch_start = std::min<unsigned long long>(batch_start, accepted_values_.size());
-            msg.committed_slot = commit_index_;
-            msg.entries.clear();
-            for (size_t i = msg.batch_start; i != accepted_values_.size(); ++i) {
-                msg.entries.push_back(accepted_values_[i]);
-            }
-        };
-        for (size_t s = 0; s != nreplicas_; ++s) {
-            if (s == index_)
-                continue;
-            co_await to_replicas_[s]->send(in_flight[s]);
-        }
-
-        std::optional<size_t> repair_target;
-        for (size_t scanned = 0; scanned != nreplicas_; ++scanned) {
-            catchup_index_ = (catchup_index_ + 1) % nreplicas_;
-            if (catchup_index_ == index_)
-                continue;
-            if (match_index_[catchup_index_] < accepted_values_.size()) {
-                repair_target = catchup_index_;
-                rebuild_suffix(*repair_target, match_index_[*repair_target]);
-                co_await to_replicas_[*repair_target]->send(in_flight[*repair_target]);
-                break;
-            }
-        }
-
-        size_t ack_count = 0;
-        while (ack_count < follower_quorum) {
-            auto ack_received = co_await cot::attempt(
-                from_replicas_.receive_with_id(),
-                cot::after(200ms)
-            );
-
-            if (!ack_received) {
-                for (size_t s = 0; s != nreplicas_; ++s) {
-                    if (s == index_ || acked[s])
-                        continue;
-                    co_await to_replicas_[s]->send(in_flight[s]);
+            if (auto* append = std::get_if<append_entries_request>(&paxos_msg)) {
+                if (append->term < current_term_) {
+                    co_await handle_append_entries(*append);
+                } else if (append->leader_id != index_) {
+                    co_await handle_append_entries(*append);
+                    co_return;
                 }
-                if (repair_target && !acked[*repair_target])
-                    co_await to_replicas_[*repair_target]->send(in_flight[*repair_target]);
                 continue;
             }
 
-            auto& [paxos_msg, source_id] = *ack_received;
-            if (message_round(paxos_msg) > propose.round) {
-                accepted_round_ = message_round(paxos_msg);
-                next_round_ = std::max(next_round_, accepted_round_ + 1);
-                leader_index_ = replica_index_from_source_id(source_id);
+            if (auto* vote = std::get_if<request_vote_request>(&paxos_msg)) {
+                if (vote->term > current_term_) {
+                    co_await handle_request_vote(*vote, sender_index);
+                    co_return;
+                }
+                request_vote_response response;
+                response.term = current_term_;
+                co_await to_replicas_[sender_index]->send(response);
+                continue;
+            }
+
+            if (message_term(paxos_msg) > current_term_) {
+                become_follower(message_term(paxos_msg), sender_index);
                 co_return;
             }
 
-            auto* ack = std::get_if<ack_msg>(&paxos_msg);
-
-            if (!ack)
-                continue;
-
-            if (ack->round != propose.round)
-                continue;
-
-            size_t sender_index = replica_index_from_source_id(source_id);
-            if (acked[sender_index])
-                continue;
-
-            if (!ack->success) {
-                match_index_[sender_index] = ack->highest_accepted;
-                applied_up_to_[sender_index] = ack->applied_up_to;
-
-                rebuild_suffix(sender_index, ack->highest_accepted);
-                repair_target = sender_index;
-                co_await to_replicas_[sender_index]->send(in_flight[sender_index]);
+            auto* append_response = std::get_if<append_entries_response>(&paxos_msg);
+            if (!append_response || append_response->term != current_term_) {
                 continue;
             }
 
-            acked[sender_index] = true;
-            match_index_[sender_index] = ack->highest_accepted;
-            applied_up_to_[sender_index] = ack->applied_up_to;
-
-            ++ack_count;
-        }
-
-        // Compute new commit index: highest index a quorum has reached
-        auto sorted = match_index_;
-        std::sort(sorted.begin(), sorted.end());
-        commit_index_ = sorted[nreplicas_ - quorum_];
-
-        unsigned long long new_applied = commit_index_;
-        if (nreplicas_ > 1) {
-            std::vector<unsigned long long> follower_applied;
-            follower_applied.reserve(nreplicas_ - 1);
-            for (size_t i = 0; i != nreplicas_; ++i) {
-                if (i != index_) {
-                    follower_applied.push_back(applied_up_to_[i]);
+            if (append_response->success) {
+                match_index_[sender_index] = std::max(match_index_[sender_index],
+                                                      append_response->match_index);
+                next_index_[sender_index] = std::max(next_index_[sender_index],
+                                                     match_index_[sender_index] + 1);
+                advance_commit_index();
+                co_await apply_committed_entries();
+            } else if (append_response->conflict_term != 0) {
+                auto next_index = append_response->conflict_index;
+                for (auto i = last_log_index(); i >= 1; --i) {
+                    if (log_term(i) == append_response->conflict_term) {
+                        next_index = i + 1;
+                        break;
+                    }
+                    if (i == 1)
+                        break;
                 }
+                next_index_[sender_index] = std::max<unsigned long long>(1, next_index);
+                co_await send_append_entries(sender_index);
+            } else {
+                next_index_[sender_index] = std::max<unsigned long long>(
+                    1, append_response->conflict_index
+                );
+                co_await send_append_entries(sender_index);
             }
-            std::sort(follower_applied.begin(), follower_applied.end());
-            new_applied = std::min(
-                commit_index_,
-                follower_applied[follower_applied.size() - follower_quorum]
-            );
+            continue;
         }
 
-        for (auto i = applied_index_; i < new_applied; ++i) {
-            auto resp = db_.process_req(accepted_values_[i]);
-            if (!pending_client_slots.empty() && pending_client_slots.front() == i) {
-                ready_client_responses.push_back(std::move(resp));
-                pending_client_slots.pop_front();
-            }
-        }
-        applied_index_ = new_applied;
-        applied_up_to_[index_] = applied_index_;
-
-        while (!ready_client_responses.empty()) {
-            co_await to_clients_.send(std::move(ready_client_responses.front()));
-            ready_client_responses.pop_front();
+        for (size_t s = 0; s != nreplicas_; ++s) {
+            co_await send_append_entries(s);
         }
     }
 }
 
 cot::task<> pt_paxos_replica::run_as_follower() {
-    while (true) {
-        auto msg = co_await cot::first(
+    check_paxos_invariants();
+    reset_election_timeout();
+    auto election_deadline = cot::steady_now() + election_timeout_;
+
+    while (role_ == raft_role::follower) {
+        auto remaining = election_deadline - cot::steady_now();
+        if (remaining <= cot::duration::zero()) {
+            role_ = raft_role::candidate;
+            co_return;
+        }
+
+        auto event = co_await cot::first(
             from_clients_.receive(),
             from_replicas_.receive_with_id(),
-            cot::after(failure_timeout_)
+            cot::after(remaining)
         );
 
-        auto* req = std::get_if<pancy::request>(&msg);
+        auto* req = std::get_if<pancy::request>(&event);
         if (req) {
             co_await cot::after(.02s); // to make it more obvious in the viz
             co_await to_clients_.send(pancy::redirection_response{
@@ -420,68 +548,114 @@ cot::task<> pt_paxos_replica::run_as_follower() {
             continue;
         }
 
-        auto* received = std::get_if<std::pair<paxos_message, std::string>>(&msg);
+        auto* received = std::get_if<std::pair<paxos_message, std::string>>(&event);
         if (!received) {
-            leader_index_ = index_;
-            next_round_ = std::max(next_round_, accepted_round_ + 1);
+            role_ = raft_role::candidate;
             co_return;
         }
 
         auto& [paxos_msg, source_id] = *received;
         size_t sender_index = replica_index_from_source_id(source_id);
-        unsigned long long incoming_round = message_round(paxos_msg);
+        bool reset_timer = false;
 
-        if (incoming_round > accepted_round_) {
-            accepted_round_ = incoming_round;
-            next_round_ = std::max(next_round_, accepted_round_ + 1);
+        if (auto* append = std::get_if<append_entries_request>(&paxos_msg)) {
+            reset_timer = co_await handle_append_entries(*append);
+        } else if (auto* vote = std::get_if<request_vote_request>(&paxos_msg)) {
+            reset_timer = co_await handle_request_vote(*vote, sender_index);
+        } else if (message_term(paxos_msg) > current_term_) {
+            become_follower(message_term(paxos_msg), sender_index);
         }
 
-        auto* propose = std::get_if<propose_msg>(&paxos_msg);
-        if (!propose) {
-            auto* probe = std::get_if<probe_msg>(&paxos_msg);
-            if (!probe)
-                continue;
+        if (reset_timer) {
+            election_deadline = cot::steady_now() + election_timeout_;
+        }
+    }
+}
 
-            if (probe->round < accepted_round_) {
-                continue;
-            }
+cot::task<> pt_paxos_replica::run_as_candidate() {
+    ++current_term_;
+    voted_for_ = index_;
+    leader_index_ = index_;
+    reset_election_timeout();
 
-            prepare_msg prepare;
-            prepare.round = probe->round;
-            prepare.accepted_round = accepted_round_;
-            prepare.applied_up_to = commit_index_;
-            prepare.accepted_values = accepted_values_;
-            co_await to_replicas_[sender_index]->send(prepare);
+    request_vote_request vote;
+    vote.term = current_term_;
+    vote.candidate_id = index_;
+    vote.last_log_index = last_log_index();
+    vote.last_log_term = last_log_term();
+    co_await send_to_other_replicas(vote);
+
+    std::vector<bool> votes(nreplicas_, false);
+    votes[index_] = true;
+    size_t vote_count = 1;
+    auto election_deadline = cot::steady_now() + election_timeout_;
+
+    while (role_ == raft_role::candidate) {
+        if (vote_count >= quorum_) {
+            become_leader();
+            co_return;
+        }
+
+        auto remaining = election_deadline - cot::steady_now();
+        if (remaining <= cot::duration::zero()) {
+            co_return;
+        }
+
+        auto event = co_await cot::first(
+            from_clients_.receive(),
+            from_replicas_.receive_with_id(),
+            cot::after(remaining)
+        );
+
+        if (auto* req = std::get_if<pancy::request>(&event)) {
+            co_await cot::after(.02s);
+            co_await to_clients_.send(pancy::redirection_response{
+                pancy::response_header(*req, pancy::errc::redirect), leader_index_
+            });
             continue;
         }
 
-        leader_index_ = sender_index;
+        auto* received = std::get_if<std::pair<paxos_message, std::string>>(&event);
+        if (!received) {
+            co_return;
+        }
 
-        // Reject stale messages (e.g., old heartbeats arriving after newer proposes)
-        if (propose->round < accepted_round_) {
+        auto& [paxos_msg, source_id] = *received;
+        size_t sender_index = replica_index_from_source_id(source_id);
+
+        if (auto* append = std::get_if<append_entries_request>(&paxos_msg)) {
+            if (append->term < current_term_) {
+                co_await handle_append_entries(*append);
+            } else {
+                co_await handle_append_entries(*append);
+                co_return;
+            }
             continue;
         }
 
-        bool no_gap = propose->batch_start <= accepted_values_.size();
-        if (no_gap) {
-            accepted_values_.resize(propose->batch_start);
-            for (const auto& e : propose->entries) {
-                accepted_values_.push_back(e);
+        if (auto* vote_request = std::get_if<request_vote_request>(&paxos_msg)) {
+            bool reset_timer = co_await handle_request_vote(*vote_request, sender_index);
+            if (role_ != raft_role::candidate)
+                co_return;
+            if (reset_timer) {
+                election_deadline = cot::steady_now() + election_timeout_;
             }
-            accepted_round_ = propose->round;
-
-            for (auto i = commit_index_; i < propose->committed_slot && i < accepted_values_.size(); ++i) {
-                db_.process_req(accepted_values_[i]);
-            }
-            commit_index_ = std::min(propose->committed_slot, (unsigned long long)accepted_values_.size());
+            continue;
         }
 
-        ack_msg ack;
-        ack.round = propose->round;
-        ack.success = no_gap;
-        ack.highest_accepted = accepted_values_.size();
-        ack.applied_up_to = commit_index_;
-        co_await to_replicas_[leader_index_]->send(ack);
+        if (message_term(paxos_msg) > current_term_) {
+            become_follower(message_term(paxos_msg), sender_index);
+            co_return;
+        }
+
+        auto* vote_response = std::get_if<request_vote_response>(&paxos_msg);
+        if (!vote_response || vote_response->term != current_term_
+            || !vote_response->vote_granted || votes[sender_index]) {
+            continue;
+        }
+
+        votes[sender_index] = true;
+        ++vote_count;
     }
 }
 
@@ -1105,14 +1279,14 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
             inst.replicas[s]->db_,
             tester.mode == failure_mode::cascading_star_partition ? 15 : 5
         );
-        // if (problem) {
-        //     std::print(std::clog,
-        //                "*** REPLICA DIVERGENCE on seed {} between replica {} and {} at key {}\n",
-        //                seed, reference, s, *problem);
-        //     db.print_near(*problem, std::clog);
-        //     inst.replicas[s]->db_.print_near(*problem, std::clog);
-        //     return false;
-        // }
+        if (problem) {
+            std::print(std::clog,
+                       "*** REPLICA DIVERGENCE on seed {} between replica {} and {} at key {}\n",
+                       seed, reference, s, *problem);
+            db.print_near(*problem, std::clog);
+            inst.replicas[s]->db_.print_near(*problem, std::clog);
+            return false;
+        }
 
         
     }

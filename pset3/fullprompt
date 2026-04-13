@@ -1,0 +1,522 @@
+# Raft Consensus Algorithm — Implementation Specification
+
+## Purpose
+
+This document is a complete, implementation-ready description of the Raft consensus algorithm. It is intended to be handed to a developer (or coding assistant) who will implement Raft from scratch. Every state variable, RPC, rule, and edge case is covered.
+
+Raft is a consensus algorithm for managing a replicated log across a cluster of servers. It is equivalent in power to Paxos but designed for understandability. The cluster can tolerate the failure of any minority of servers (e.g., 2 out of 5).
+
+---
+
+## 1. Core Concepts
+
+### 1.1 Replicated State Machine
+
+The system consists of multiple servers, each running an identical deterministic state machine. Clients send commands to the cluster. The cluster's job is to ensure every server's state machine executes the exact same sequence of commands in the exact same order, even if servers crash and restart.
+
+This is achieved via a **replicated log**. Each server maintains a log of commands. The consensus algorithm ensures all logs eventually contain the same entries in the same order. Each server's state machine consumes the log in order.
+
+### 1.2 Server Roles
+
+Every server is in exactly one of three states at any time:
+
+- **Leader**: Handles all client requests. Replicates log entries to followers. There is at most one leader per term. The leader is the single source of truth for the log.
+- **Follower**: Passive. Responds to RPCs from leaders and candidates. If a client contacts a follower, the follower redirects the client to the leader.
+- **Candidate**: A transitional state used during leader election. A follower becomes a candidate when it suspects the leader has failed.
+
+**State transitions:**
+
+```
+Follower --[election timeout, no heartbeat]--> Candidate
+Candidate --[receives majority votes]--> Leader
+Candidate --[discovers leader or higher term]--> Follower
+Candidate --[election timeout, no winner]--> Candidate (new election)
+Leader --[discovers higher term]--> Follower
+```
+
+### 1.3 Terms
+
+Time is divided into **terms**, numbered with consecutive integers starting from 0 (or 1). Each term begins with an election. If a candidate wins, it serves as leader for the rest of the term. If no candidate wins (split vote), the term ends with no leader and a new term begins immediately.
+
+**Key rules about terms:**
+- Each server stores a `currentTerm` value that increases monotonically.
+- Whenever any RPC request or response is received, if the sender's term is greater than the receiver's `currentTerm`, the receiver updates `currentTerm` to the sender's term and converts to follower.
+- If a candidate or leader discovers its term is stale (another server has a higher term), it immediately reverts to follower.
+- If a server receives an RPC with a term smaller than its own `currentTerm`, it rejects the RPC.
+- Terms act as a logical clock and allow servers to detect stale information.
+
+---
+
+## 2. Persistent State (on all servers)
+
+These MUST be persisted to stable storage (disk) before responding to any RPC. If you lose these on crash, safety is violated.
+
+| Variable | Type | Initial Value | Description |
+|---|---|---|---|
+| `currentTerm` | integer | 0 | The latest term this server has seen. Increases monotonically. |
+| `votedFor` | server ID or null | null | The candidateId that this server voted for in the current term, or null if it hasn't voted. |
+| `log[]` | array of log entries | empty | Each entry contains: `command` (the state machine command), `term` (the term when the entry was received by the leader). Log is 1-indexed. |
+
+**Critical**: `currentTerm` and `votedFor` must be updated atomically on disk before sending any RPC response. Failure to persist these before responding can violate the "at most one leader per term" safety property.
+
+---
+
+## 3. Volatile State
+
+### 3.1 On All Servers
+
+| Variable | Type | Initial Value | Description |
+|---|---|---|---|
+| `commitIndex` | integer | 0 | Index of the highest log entry known to be committed. Increases monotonically. |
+| `lastApplied` | integer | 0 | Index of the highest log entry applied to the state machine. Increases monotonically. |
+
+### 3.2 On Leaders Only (reinitialized after each election)
+
+| Variable | Type | Initial Value | Description |
+|---|---|---|---|
+| `nextIndex[]` | array of integers | leader's last log index + 1 (for each server) | For each server, the index of the next log entry to send to that server. |
+| `matchIndex[]` | array of integers | 0 (for each server) | For each server, the index of the highest log entry known to be replicated on that server. Increases monotonically. |
+
+---
+
+## 4. RPC Definitions
+
+### 4.1 AppendEntries RPC
+
+Invoked by the leader to replicate log entries and also used as a heartbeat (when `entries[]` is empty).
+
+**Arguments:**
+
+| Field | Type | Description |
+|---|---|---|
+| `term` | integer | Leader's current term. |
+| `leaderId` | server ID | So followers can redirect clients to the leader. |
+| `prevLogIndex` | integer | Index of the log entry immediately preceding the new entries being sent. |
+| `prevLogTerm` | integer | Term of the entry at `prevLogIndex`. |
+| `entries[]` | array of log entries | Log entries to store (empty for heartbeat; may send more than one for efficiency). |
+| `leaderCommit` | integer | Leader's `commitIndex`. |
+
+**Results:**
+
+| Field | Type | Description |
+|---|---|---|
+| `term` | integer | Receiver's `currentTerm`, so the leader can update itself. |
+| `success` | boolean | True if the follower's log contained an entry matching `prevLogIndex` and `prevLogTerm`. |
+
+**Receiver implementation (step by step):**
+
+1. If `term < currentTerm`, reply `success = false` with your `currentTerm`. (The caller is a stale leader.)
+2. If your log does not contain an entry at index `prevLogIndex` whose term matches `prevLogTerm`, reply `success = false`. (The consistency check failed — the leader needs to back up.)
+3. If an existing entry in your log conflicts with a new entry at the same index (same index but different term), **delete that existing entry and all entries that follow it**. This is critical — you must truncate the log from the conflict point onward.
+4. Append any new entries that are not already in your log. (Don't re-append entries you already have at the same index with the same term.)
+5. If `leaderCommit > commitIndex`, set `commitIndex = min(leaderCommit, index of last new entry)`.
+
+**Edge cases for AppendEntries:**
+- When `entries[]` is empty, this is a heartbeat. Steps 3-4 are no-ops but steps 1, 2, and 5 still apply.
+- `prevLogIndex` can be 0 if the leader is sending entries starting from the beginning of the log. In that case, there is no previous entry to check; the consistency check trivially succeeds.
+- Be careful in step 3: only delete entries that actually conflict. If the follower already has entries that match (same index, same term), do NOT delete them. Only truncate starting from a mismatch.
+- After a successful AppendEntries, the follower should reset its election timer.
+
+### 4.2 RequestVote RPC
+
+Invoked by candidates during elections to gather votes.
+
+**Arguments:**
+
+| Field | Type | Description |
+|---|---|---|
+| `term` | integer | Candidate's current term. |
+| `candidateId` | server ID | The candidate requesting the vote. |
+| `lastLogIndex` | integer | Index of the candidate's last log entry. |
+| `lastLogTerm` | integer | Term of the candidate's last log entry. |
+
+**Results:**
+
+| Field | Type | Description |
+|---|---|---|
+| `term` | integer | Receiver's `currentTerm`, so the candidate can update itself. |
+| `voteGranted` | boolean | True if the receiver grants its vote to the candidate. |
+
+**Receiver implementation:**
+
+1. If `term < currentTerm`, reply `voteGranted = false`.
+2. If `votedFor` is null or is already set to `candidateId`, AND the candidate's log is **at least as up-to-date** as the receiver's log, grant the vote (`voteGranted = true`). Otherwise, deny.
+
+**Log up-to-date comparison (critical):**
+
+Raft determines which of two logs is more up-to-date by comparing the **last entry** in each log:
+- If the logs have last entries with **different terms**, the log with the **later (higher) term** is more up-to-date.
+- If the logs end with the **same term**, the **longer** log (higher last index) is more up-to-date.
+
+This is the **election restriction** and is essential for safety. It ensures that a candidate cannot win an election unless its log contains all committed entries.
+
+**Edge cases for RequestVote:**
+- If a server has already voted for a different candidate in this term, it must deny the vote. Each server votes for at most one candidate per term (first-come-first-served).
+- If the RequestVote RPC updates the receiver's `currentTerm` (because the candidate's term is higher), the receiver should first update `currentTerm` and set `votedFor = null`, then evaluate the vote request with the new term.
+- Granting a vote should reset the server's election timer (to prevent it from starting its own election while a valid election is in progress).
+
+### 4.3 InstallSnapshot RPC
+
+Invoked by the leader to send a snapshot to a follower that has fallen too far behind.
+
+**Arguments:**
+
+| Field | Type | Description |
+|---|---|---|
+| `term` | integer | Leader's current term. |
+| `leaderId` | server ID | So follower can redirect clients. |
+| `lastIncludedIndex` | integer | The index of the last log entry included in the snapshot. |
+| `lastIncludedTerm` | integer | The term of the last log entry included in the snapshot. |
+| `offset` | integer | Byte offset where this chunk is positioned in the snapshot file. |
+| `data[]` | bytes | Raw bytes of the snapshot chunk starting at `offset`. |
+| `done` | boolean | True if this is the last chunk. |
+
+**Results:**
+
+| Field | Type | Description |
+|---|---|---|
+| `term` | integer | Receiver's `currentTerm`, for leader to update itself. |
+
+**Receiver implementation:**
+
+1. Reply immediately if `term < currentTerm`.
+2. Create a new snapshot file if this is the first chunk (`offset` is 0).
+3. Write `data` into snapshot file at the given `offset`.
+4. Reply and wait for more data chunks if `done` is false.
+5. Save the snapshot file; discard any existing or partial snapshot with a smaller index.
+6. If the server's existing log has an entry at `lastIncludedIndex` with term matching `lastIncludedTerm`, retain all log entries following that index and reply.
+7. Otherwise, discard the entire log.
+8. Reset the state machine using the snapshot contents (and load the snapshot's cluster configuration).
+
+---
+
+## 5. Server Behavior Rules
+
+These rules run continuously and independently on every server.
+
+### 5.1 All Servers
+
+- **Apply committed entries**: If `commitIndex > lastApplied`, increment `lastApplied` and apply `log[lastApplied]` to the state machine. Entries must be applied in log index order.
+- **Step down on higher term**: If any RPC request or response contains a term `T > currentTerm`, set `currentTerm = T`, convert to follower, and set `votedFor = null`.
+
+### 5.2 Follower Behavior
+
+- Respond to RPCs from candidates and leaders.
+- If **election timeout** elapses without receiving a valid AppendEntries RPC from the current leader or granting a vote to a candidate: convert to candidate and start an election.
+- The election timeout should be chosen randomly from a fixed interval (e.g., 150–300ms). Each server picks a new random timeout each time it resets its timer. This randomization prevents synchronized elections and split votes.
+
+**What resets the election timer:**
+- Receiving a valid AppendEntries RPC from the current leader (including heartbeats). "Valid" means the term is >= your currentTerm.
+- Granting a vote to a candidate.
+- Starting an election (converting to candidate).
+
+**What does NOT reset the election timer:**
+- Receiving an AppendEntries with a stale term (you reject it, don't reset).
+- Receiving a RequestVote that you deny.
+
+### 5.3 Candidate Behavior
+
+On conversion to candidate:
+
+1. Increment `currentTerm`.
+2. Vote for self (set `votedFor = self`).
+3. Reset the election timer (pick a new random timeout).
+4. Send `RequestVote` RPCs in parallel to all other servers.
+
+Then wait. One of three outcomes:
+
+- **Win**: Receives votes from a **majority** of servers (including self) for this term. Become leader. Immediately send heartbeats (empty AppendEntries) to all servers to establish authority and prevent new elections.
+- **Lose**: Receives an AppendEntries RPC from another server with a term >= your `currentTerm`. That server is the legitimate leader. Convert to follower.
+- **Timeout**: Election timeout elapses with no winner and no legitimate leader discovered. Start a new election (increment term, vote for self again, send new RequestVote RPCs).
+
+**Edge cases for candidates:**
+- If a candidate receives a RequestVote response with a term higher than its own `currentTerm`, it must step down to follower.
+- If a candidate receives a RequestVote response with `voteGranted = false` and the same term, it simply notes the rejection and continues waiting.
+- A candidate only counts votes from the current term. If it starts a new election (new term), old votes are irrelevant.
+- Split votes are resolved by the randomized election timeout. Because each candidate picks a random timeout before retrying, one candidate is likely to time out first and win the next election.
+
+### 5.4 Leader Behavior
+
+Upon election:
+
+1. Initialize `nextIndex[i]` to `last log index + 1` for every other server.
+2. Initialize `matchIndex[i]` to `0` for every other server.
+3. Send initial empty AppendEntries RPCs (heartbeats) to every server.
+
+Ongoing:
+
+- **Heartbeats**: Send empty AppendEntries RPCs to all followers during idle periods to prevent election timeouts. Heartbeat interval should be much less than the election timeout (e.g., if election timeout is 150-300ms, heartbeat every 50ms).
+- **Client requests**: When a command is received from a client, append it as a new entry to the local log (with the current term), then replicate it.
+- **Log replication**: For each follower, if `last log index >= nextIndex[i]`, send an AppendEntries RPC containing log entries starting at `nextIndex[i]`.
+  - On **success**: Update `nextIndex[i] = index of last entry sent + 1`. Update `matchIndex[i] = index of last entry sent`.
+  - On **failure** (due to log inconsistency): Decrement `nextIndex[i]` by 1 and retry. (The follower's log doesn't match at `prevLogIndex`; back up until you find the matching point.)
+- **Advancing commitIndex**: If there exists an index `N` such that:
+  1. `N > commitIndex`, AND
+  2. A majority of `matchIndex[i] >= N` (including the leader itself), AND
+  3. `log[N].term == currentTerm`
+
+  ...then set `commitIndex = N`. **Use the largest such N.**
+
+**Critical**: Condition 3 is essential. A leader must NOT commit entries from a previous term by counting replicas. It can only directly commit entries from its own term. Once an entry from the current term is committed, all preceding entries become implicitly committed via the Log Matching Property. This prevents a subtle safety bug — see Section 7.2 for the explanation.
+
+**Edge cases for leaders:**
+- A leader never deletes or overwrites entries in its own log. It only appends.
+- A leader must continue retrying AppendEntries RPCs to slow or crashed followers indefinitely, even after responding to the client.
+- If a leader cannot reach a majority, it cannot commit new entries and should not respond to clients (the commands are pending).
+- If the leader discovers its term is stale (a response comes back with a higher term), it must immediately step down to follower.
+
+---
+
+## 6. Optimization: Fast Log Backtracking
+
+The basic algorithm decrements `nextIndex` by 1 on each failed AppendEntries, which can be slow if the follower is far behind.
+
+**Optimization**: When a follower rejects an AppendEntries, it can include additional information in its response:
+
+- `conflictTerm`: The term of the conflicting entry at `prevLogIndex` (or 0/null if the follower has no entry at that index).
+- `conflictIndex`: The first index the follower stores for `conflictTerm` (or the follower's log length + 1 if it has no entry at `prevLogIndex`).
+
+**Leader behavior on rejection with conflict info:**
+- If `conflictTerm` is null/0 (follower's log is too short): Set `nextIndex = conflictIndex` (the follower's log length + 1).
+- If `conflictTerm` is set: Search the leader's log for `conflictTerm`. If found, set `nextIndex` to the leader's last entry for that term + 1. If not found, set `nextIndex = conflictIndex`.
+
+This allows the leader to skip entire terms of conflicting entries at once instead of one entry at a time.
+
+---
+
+## 7. Safety Properties and Why They Hold
+
+### 7.1 The Five Guarantees
+
+Your implementation must maintain all of these invariants:
+
+1. **Election Safety**: At most one leader can be elected in a given term.
+   - *Why*: Each server votes for at most one candidate per term (persisted `votedFor`), and a candidate needs a majority to win. Two majorities necessarily overlap, so two candidates cannot both get a majority in the same term.
+
+2. **Leader Append-Only**: A leader never overwrites or deletes entries in its own log; it only appends new entries.
+   - *Enforce*: Never mutate the leader's log except by appending.
+
+3. **Log Matching**: If two logs contain an entry with the same index and term, then the logs are identical in all entries up through that index.
+   - *Why*: A leader creates at most one entry per index per term. The AppendEntries consistency check (prevLogIndex/prevLogTerm) acts as an inductive proof: the empty log satisfies this, and each successful AppendEntries preserves it.
+
+4. **Leader Completeness**: If a log entry is committed in a given term, that entry will be present in the logs of leaders for all higher-numbered terms.
+   - *Why*: The election restriction ensures a candidate can only win if its log is at least as up-to-date as a majority's logs. Since a committed entry is on a majority, any future leader must have it.
+
+5. **State Machine Safety**: If a server has applied a log entry at a given index to its state machine, no other server will ever apply a different log entry for the same index.
+   - *Why*: Follows from Leader Completeness and the fact that entries are applied in log order only after being committed.
+
+### 7.2 Why Leaders Cannot Commit Old-Term Entries by Counting
+
+This is a subtle but critical point. Consider this scenario:
+
+1. Leader S1 (term 2) replicates an entry at index 2 to some servers, then crashes.
+2. S5 is elected leader for term 3 (voted by S3, S4, S5), writes a different entry at index 2, then crashes.
+3. S1 restarts, gets elected leader for term 4, and continues replicating the old entry at index 2 from term 2. It gets this entry onto a majority of servers.
+4. If S1 commits this entry (from term 2) based on it being on a majority, then crashes...
+5. S5 could be elected leader for term 5 (voted by S2, S3, S4) and overwrite index 2 with its entry from term 3. This violates safety — a committed entry was overwritten.
+
+**Solution**: A leader only commits entries from its own current term by counting replicas. Once it commits an entry from the current term, all prior entries become committed too (by the Log Matching Property). In the scenario above, S1 in term 4 would first replicate a new entry from term 4 and commit that, which implicitly commits the term 2 entry as well. If S1 manages to commit a term 4 entry on a majority, S5 can no longer win an election (it would be less up-to-date).
+
+---
+
+## 8. Log Compaction (Snapshotting)
+
+The log cannot grow without bound. Snapshotting is the simplest compaction approach.
+
+### 8.1 Snapshot Contents
+
+Each server independently takes snapshots that include:
+- The entire current state machine state.
+- **Metadata**: `lastIncludedIndex` (the index of the last log entry included in the snapshot) and `lastIncludedTerm` (the term of that entry).
+- The latest cluster configuration as of `lastIncludedIndex`.
+
+### 8.2 When to Snapshot
+
+Take a snapshot when the log exceeds a configurable size threshold (e.g., in bytes). The threshold should be significantly larger than the expected snapshot size to amortize the cost.
+
+### 8.3 Snapshot Procedure
+
+1. Write the state machine state and metadata to a snapshot file on disk.
+2. Delete all log entries up through `lastIncludedIndex`, as well as any prior snapshot.
+3. Retain log entries after `lastIncludedIndex` (they may not yet be committed or may be needed for replication).
+
+### 8.4 Interaction with AppendEntries
+
+After a snapshot, the first remaining log entry needs a `prevLogIndex` and `prevLogTerm` for the AppendEntries consistency check. These come from the snapshot's `lastIncludedIndex` and `lastIncludedTerm`.
+
+### 8.5 InstallSnapshot: When the Leader Has Discarded Needed Entries
+
+If the leader needs to send entries to a follower, but has already discarded those entries via a snapshot, the leader sends its snapshot to the follower using the `InstallSnapshot` RPC (see Section 4.3). After the follower installs the snapshot, the leader can resume normal AppendEntries from the point after the snapshot.
+
+### 8.6 Performance Considerations
+
+- Use copy-on-write techniques (e.g., `fork()` on Linux) so the server can continue accepting new entries while the snapshot is being written.
+- Each server snapshots independently. Do NOT have the leader create a snapshot and send it to all followers — that wastes bandwidth. Followers create their own snapshots from their local state.
+
+---
+
+## 9. Cluster Membership Changes
+
+### 9.1 The Problem
+
+You cannot atomically switch all servers from an old configuration to a new one. During a transition, there could be a moment where two different majorities (one from the old config, one from the new) could each independently elect a leader, violating safety.
+
+### 9.2 Joint Consensus
+
+Raft uses a two-phase approach via **joint consensus**:
+
+**Phase 1**: The leader creates a special log entry `C_old,new` (the joint configuration) that combines both the old and new configurations. It replicates this entry using normal Raft mechanisms. While `C_old,new` is active:
+- Log entries are replicated to all servers in BOTH configurations.
+- Agreement (for elections and commits) requires **separate majorities from both** the old and new configurations.
+- Any server from either configuration may serve as leader.
+
+**Phase 2**: Once `C_old,new` is committed, the leader creates a `C_new` log entry (the new configuration alone) and replicates it. Once `C_new` is committed, the old configuration is irrelevant and servers not in `C_new` can be shut down.
+
+**Key rule**: A server always uses the latest configuration in its log, regardless of whether that configuration entry is committed.
+
+### 9.3 Edge Cases for Membership Changes
+
+1. **New servers have empty logs**: They need time to catch up. Raft adds a pre-phase where new servers join as non-voting members (they receive log entries but don't count toward majorities) until they've caught up.
+
+2. **Leader not in new configuration**: The leader steps down (becomes follower) once it has committed `C_new`. During the transition, it manages the cluster but does not count itself in majorities for `C_new`.
+
+3. **Removed servers disrupt the cluster**: Servers not in `C_new` won't receive heartbeats, so they'll time out and start elections with higher term numbers, causing the current leader to step down. **Solution**: A server should disregard `RequestVote` RPCs if it has received a heartbeat from the current leader within the minimum election timeout. This prevents removed servers from disrupting the cluster while allowing normal elections to proceed.
+
+---
+
+## 10. Client Interaction
+
+### 10.1 Finding the Leader
+
+- Clients connect to any server. If it's not the leader, the server responds with the address of the leader it last heard from (included in AppendEntries RPCs).
+- If the leader crashes, the client's request times out. The client retries with a randomly chosen server.
+
+### 10.2 Linearizable Semantics
+
+Raft must ensure each client command is executed **exactly once** in a linearizable order.
+
+**Problem**: If the leader commits a log entry but crashes before responding to the client, the client will retry the command with the new leader, causing the command to be executed twice.
+
+**Solution**: Each client assigns a unique serial number to every command. The state machine tracks the latest serial number processed for each client and its associated response. If a command arrives with a serial number that has already been executed, the state machine returns the cached response without re-executing.
+
+### 10.3 Read-Only Operations
+
+Read-only operations could be served without writing to the log, but naively doing so risks returning stale data (the leader might have been deposed without knowing it).
+
+**Two safeguards for linearizable reads:**
+
+1. **No-op on term start**: When a leader first takes office, it commits a blank no-op entry. This ensures it knows the correct commit point for all prior entries.
+2. **Heartbeat lease check**: Before responding to a read-only request, the leader must confirm it is still the leader by exchanging heartbeats with a majority of the cluster. Only after receiving responses from a majority can it serve the read.
+
+Alternatively, a leader can use a heartbeat-based lease, but this relies on bounded clock skew and is less safe.
+
+---
+
+## 11. Timing Requirements
+
+Safety does NOT depend on timing. The algorithm is safe regardless of message delays. However, **availability** (liveness) requires:
+
+```
+broadcastTime << electionTimeout << MTBF
+```
+
+Where:
+- `broadcastTime`: Average time to send RPCs to all servers and receive responses (typically 0.5ms–20ms).
+- `electionTimeout`: The election timeout (typically 150–300ms, randomly chosen per server per election cycle).
+- `MTBF`: Mean time between failures for a single server (typically months).
+
+The broadcast time must be much less than the election timeout so leaders can maintain heartbeats. The election timeout must be much less than MTBF so the system makes progress.
+
+**Practical recommendations:**
+- Election timeout: random value in [150ms, 300ms].
+- Heartbeat interval: ~50ms (well under the minimum election timeout).
+- Randomize the election timeout each time a server starts an election or resets its timer.
+
+---
+
+## 12. Implementation Checklist
+
+Use this checklist to verify your implementation covers all required behaviors:
+
+### Persistence
+- [ ] `currentTerm`, `votedFor`, and `log[]` are persisted to stable storage before any RPC response is sent.
+- [ ] On server restart, these values are restored from disk.
+
+### Leader Election
+- [ ] Election timeout is randomized from a configurable range (e.g., 150–300ms).
+- [ ] Election timer resets on: valid AppendEntries received, vote granted, conversion to candidate.
+- [ ] Candidate increments term, votes for self, sends RequestVote to all peers.
+- [ ] Candidate becomes leader only upon receiving a majority of votes for the current term.
+- [ ] Vote is granted only if: `votedFor` is null or matches `candidateId`, AND candidate's log is at least as up-to-date.
+- [ ] Log up-to-date comparison uses last entry's term first, then length.
+- [ ] Server steps down to follower if it sees a higher term in any RPC.
+
+### Log Replication
+- [ ] Leader appends client commands to its log with the current term.
+- [ ] Leader sends AppendEntries with correct `prevLogIndex` and `prevLogTerm`.
+- [ ] Follower rejects AppendEntries if `prevLogIndex`/`prevLogTerm` don't match.
+- [ ] Follower truncates conflicting entries (same index, different term) and appends new ones.
+- [ ] Leader decrements `nextIndex` on AppendEntries failure and retries.
+- [ ] Leader updates `nextIndex` and `matchIndex` on AppendEntries success.
+- [ ] Leader advances `commitIndex` only when a majority has replicated an entry AND that entry is from the current term.
+
+### Commitment and Application
+- [ ] Entries are applied to the state machine in log index order.
+- [ ] Entries are applied only after they are committed (`commitIndex >= entry index`).
+- [ ] `lastApplied` tracks the most recently applied entry.
+- [ ] Leader only counts replicas for entries from its own term to advance `commitIndex`.
+
+### Heartbeats
+- [ ] Leader sends periodic heartbeats (empty AppendEntries) to all followers.
+- [ ] Heartbeat interval is much less than minimum election timeout.
+
+### Snapshotting
+- [ ] Server takes snapshots when log exceeds a size threshold.
+- [ ] Snapshot includes: state machine state, `lastIncludedIndex`, `lastIncludedTerm`, current cluster configuration.
+- [ ] Log entries up to and including `lastIncludedIndex` are discarded after snapshotting.
+- [ ] Leader sends InstallSnapshot RPC to followers that need entries the leader has already discarded.
+- [ ] Follower discards its log and resets state machine when receiving a snapshot that supersedes its log.
+
+### Client Interaction
+- [ ] Non-leader servers redirect clients to the leader.
+- [ ] Client commands include unique serial numbers for deduplication.
+- [ ] State machine caches the result of the last command per client and serves cached responses for duplicate serial numbers.
+- [ ] Read-only requests require the leader to confirm leadership (heartbeat exchange with majority) before responding.
+- [ ] Leader commits a no-op entry at the start of each term.
+
+### RPCs
+- [ ] All RPCs are idempotent (safe to retry on timeout).
+- [ ] RPCs are retried indefinitely until they succeed.
+- [ ] RPCs are sent in parallel for performance.
+- [ ] Every RPC response includes the sender's `currentTerm`.
+
+### Cluster Membership Changes
+- [ ] Configuration changes go through joint consensus (`C_old,new` then `C_new`).
+- [ ] During joint consensus, separate majorities from both old and new configurations are required.
+- [ ] New servers catch up as non-voting members before entering the configuration.
+- [ ] Leader steps down after committing `C_new` if it is not in the new configuration.
+- [ ] Servers disregard RequestVote RPCs received within the minimum election timeout of the last heartbeat from a leader.
+
+---
+
+## 13. Common Implementation Pitfalls
+
+1. **Forgetting to persist before responding**: If `currentTerm` or `votedFor` is not on disk before an RPC response, a crash-restart can cause a server to vote twice in the same term. This breaks election safety.
+
+2. **Committing entries from previous terms by counting replicas**: This is the Figure 8 bug. Only commit entries from the current term by counting. Prior entries become committed as a side effect.
+
+3. **Not resetting election timer correctly**: Resetting the timer on rejected RPCs or on every RPC (not just valid ones) can cause liveness issues or safety issues.
+
+4. **Truncating the log eagerly on AppendEntries**: Only truncate entries that actually conflict (same index, different term). If a delayed/duplicate AppendEntries arrives with entries the follower already has (same index, same term), do not truncate.
+
+5. **Applying entries before they are committed**: Never apply a log entry to the state machine until `commitIndex >= that entry's index`.
+
+6. **Not stepping down when a higher term is seen**: This must happen on ANY RPC (request or response), including AppendEntries responses from followers. If a leader sends an AppendEntries and gets back a response with a higher term, it must step down immediately.
+
+7. **Leader serving reads without confirming leadership**: A deposed leader that doesn't know it's been deposed could serve stale reads. Always confirm leadership before serving read-only requests.
+
+8. **Not handling the case where a follower's log is shorter than prevLogIndex**: The follower should reject the AppendEntries (it doesn't have an entry at `prevLogIndex`), not crash.
+
+9. **Concurrent elections with no progress**: Without randomized timeouts, candidates can repeatedly split votes indefinitely. Always randomize the election timeout.
+
+10. **Sending the entire log in every AppendEntries**: Only send entries starting from `nextIndex[i]`. Use the backtracking mechanism to find the right starting point efficiently.
